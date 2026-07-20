@@ -7,9 +7,10 @@ Scoring und eine kleine Streamlit-Anwendung.
 
 ## Projektstatus
 
-**Phase 1 – Projektgrundlage.** Aktuell stehen die installierbare Paketstruktur, eine
-neutrale Startseite und die lokalen Qualitätsprüfungen. Datenabruf, Typenlogik, Rollen
-und Empfehlungen sind bewusst noch nicht implementiert.
+**Phase 1 – Projektgrundlage ist abgeschlossen.** Die installierbare Paketstruktur,
+eine neutrale Startseite und die lokalen Qualitätsprüfungen sind eingerichtet und
+getestet. Datenabruf, Typenlogik, Rollen und Empfehlungen sind bewusst noch nicht
+implementiert.
 
 ## MVP-Umfang
 
@@ -19,7 +20,7 @@ Geplant sind:
 - Basiswerte sowie Typen-Schwächen, -Resistenzen und -Immunitäten
 - transparente, zunächst regelbasierte Rollen und ein Clustering-Vergleich
 - erklärbare Top-5-Empfehlungen für ein Team aus genau fünf Pokémon
-- lokale Datenhaltung, DuckDB-Auswertungen und eine Streamlit-Oberfläche
+- lokaler Raw-Data-Cache, Supabase PostgreSQL und eine Streamlit-Oberfläche
 
 Nicht Teil des MVP sind Movesets, Items, komplexe Fähigkeiten, EVs/IVs, Wesen,
 Terakristallisierung, Wetter, Schadensrechnung und Kampfsimulationen.
@@ -33,7 +34,7 @@ Terakristallisierung, Wetter, Schadensrechnung und Kampfsimulationen.
 ## Installation
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/Gerryyyyyyyyyyy/pokemon-team-advisor.git
 cd pokemon-team-advisor
 uv sync --locked
 uv run pre-commit install
@@ -46,17 +47,52 @@ unterstützt werden.
 Nach einer beabsichtigten Abhängigkeitsänderung wird die Lock-Datei mit `uv lock`
 aktualisiert und zusammen mit `pyproject.toml` geprüft.
 
-## Lokaler Start
+### Installation unter Windows
 
-```bash
-make run
+`uv` lässt sich in PowerShell über WinGet installieren:
+
+```powershell
+winget install --id=astral-sh.uv -e
 ```
 
-Ohne Make:
+Nach einem vollständigen Neustart von VS Code:
+
+```powershell
+uv --version
+uv sync --locked
+uv run pre-commit install
+```
+
+Als VS-Code-Interpreter wird anschließend `.venv\Scripts\python.exe` ausgewählt. Die
+virtuelle Umgebung ist lokal und wird nicht in Git gespeichert.
+
+### Supabase-Konfiguration
+
+Die Anwendung verwendet Supabase als verwaltetes PostgreSQL. Kopiere die Vorlage und
+trage anschließend die vollständige Verbindungs-URL aus **Supabase Dashboard → Connect**
+in `.env` ein:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+```dotenv
+DATABASE_URL=postgresql://...
+```
+
+`.env` ist über `.gitignore` ausgeschlossen und darf niemals committed werden. Lokal
+kann bei fehlender IPv6-Unterstützung die Session-Pooler-URL verwendet werden. Für ein
+späteres Deployment wird die passende Verbindung anhand der Hosting-Umgebung gewählt.
+Die Details beschreibt die
+[Supabase-Dokumentation](https://supabase.com/docs/guides/database/connecting-to-postgres).
+
+## Lokaler Start
 
 ```bash
 uv run streamlit run src/pokemon_team_advisor/app.py
 ```
+
+Mit installiertem GNU Make steht alternativ `make run` zur Verfügung.
 
 Streamlit zeigt anschließend die lokale URL im Terminal. In Phase 1 ist nur die
 Projekt-Startseite sichtbar.
@@ -69,6 +105,16 @@ make coverage   # zusätzlicher Coverage-Bericht ohne künstlichen Start-Grenzwe
 make format     # Code automatisch formatieren und sichere Ruff-Fixes anwenden
 ```
 
+Unter Windows oder ohne Make können die Prüfungen direkt ausgeführt werden:
+
+```powershell
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy
+uv run pytest
+uv run pre-commit run --all-files
+```
+
 Ein Coverage-Mindestwert wird eingeführt, sobald in den nächsten Phasen kritische
 Geschäftslogik existiert. Dadurch wird die Kennzahl nicht mit wertlosen Platzhaltertests
 aufgefüllt.
@@ -77,6 +123,9 @@ aufgefüllt.
 
 ```text
 pokemon-team-advisor/
+├── .gitattributes
+├── .env.example
+├── .pre-commit-config.yaml
 ├── data/
 │   ├── external/
 │   ├── processed/
@@ -85,7 +134,9 @@ pokemon-team-advisor/
 ├── reports/figures/
 ├── src/pokemon_team_advisor/
 │   ├── __init__.py
-│   └── app.py
+│   ├── app.py
+│   ├── collect_data.py
+│   └── database.py
 ├── tests/unit/
 ├── Makefile
 ├── pyproject.toml
@@ -99,7 +150,7 @@ Navigation erschweren, ohne bereits einen technischen Vertrag zu bieten.
 ## Geplante Datenpipeline
 
 ```text
-PokéAPI → Raw-Data-Cache → Validierung → verarbeiteter Datensatz → DuckDB
+PokéAPI → Raw-Data-Cache → Validierung → verarbeiteter Datensatz → Supabase PostgreSQL
         → Feature Engineering → Recommendation Engine → Streamlit
 ```
 
@@ -111,7 +162,7 @@ Metadatendatei mit Abrufdatum, Quelle, Endpunkt, Filtern, Datensatzanzahl und Ha
 
 1. **Projektgrundlage** – Struktur, Installation, Qualitätstools
 2. **Datensammlung** – PokéAPI-Client, lokaler Cache, Validierung
-3. **EDA und SQL** – Datenqualität, Visualisierungen, DuckDB-Analysen
+3. **EDA und SQL** – Datenqualität, Visualisierungen, Supabase-PostgreSQL-Analysen
 4. **Typensystem** – Matrix, Dual-Types, Team-Schwächen, Tests
 5. **Rollen** – Regeln, skalierte Werte, interpretierter Clustering-Vergleich
 6. **Recommender** – erklärbare Scores, Evaluation, Sensitivitätsanalyse
