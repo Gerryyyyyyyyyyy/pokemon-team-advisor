@@ -1,22 +1,33 @@
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import cast
 
 import httpx
 
+# Eine zentrale Konstante verhindert, dass die Basis-URL an mehreren Stellen als
+# sogenannter Magic String verteilt wird.
 POKEAPI_BASE_URL = "https://pokeapi.co/api/v2"
+
+# Ein Timeout verhindert, dass die Pipeline bei einer gestörten Netzwerkverbindung
+# unbegrenzt wartet. HTTPX verwendet diesen Wert für Connect-, Read-, Write- und
+# Pool-Timeouts. Der Wert kann beim Erzeugen des Clients überschrieben werden.
 DEFAULT_TIMEOUT_SECONDS = 10.0
+
+# Drei Versuche bedeuten: eine ursprüngliche Anfrage und höchstens zwei
+# Wiederholungen. Das ist robust gegenüber kurzen Störungen, belastet die API aber
+# nicht mit einer endlosen Wiederholungsschleife.
 DEFAULT_MAX_ATTEMPTS = 3
+
+# Zwischen fehlgeschlagenen Versuchen warten wir zunächst 0,5 Sekunden. Durch den
+# exponentiellen Backoff wird daraus vor dem dritten Versuch 1,0 Sekunde.
 DEFAULT_RETRY_DELAY_SECONDS = 0.5
 
 # Nur Statuscodes, die typischerweise einen vorübergehenden Zustand beschreiben,
-# werden wiederholt:
-# - 429: Wir haben in kurzer Zeit zu viele Anfragen gesendet.
-# - 500/502/503/504: Der API-Server oder ein vorgeschalteter Dienst hat ein
-#   temporäres Problem.
+# werden wiederholt. 429 steht für zu viele Anfragen; die ausgewählten 5xx-Codes
+# beschreiben temporäre Probleme bei der API oder einem vorgeschalteten Dienst.
 RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 
 # Ein eindeutiger User-Agent macht unsere Anwendung in Server-Logs erkennbar. Das
@@ -24,13 +35,11 @@ RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 USER_AGENT = "pokemon-team-advisor/0.1.0"
 
 # Bibliothekscode sollte keine globale Logging-Konfiguration vornehmen. Mit einem
-# Modul-Logger kann die spätere Anwendung selbst entscheiden, ob und wohin
-# Warnungen geschrieben werden.
+# Modul-Logger entscheidet später die Anwendung, ob und wohin Warnungen gelangen.
 LOGGER = logging.getLogger(__name__)
 
-# Der Alias macht sichtbar, welche Art Funktion als ``sleep`` übergeben wird. In
-# Produktion ist das ``time.sleep``; Tests verwenden stattdessen ``list.append``
-# und müssen dadurch nicht wirklich warten.
+# In Produktion ist der Sleeper ``time.sleep``. Tests verwenden stattdessen eine
+# Funktion ohne echte Wartezeit und bleiben dadurch schnell.
 type Sleeper = Callable[[float], None]
 
 # Die PokéAPI liefert an der obersten Ebene immer ein JSON-Objekt. ``object`` ist
@@ -85,18 +94,10 @@ def _validate_retry_settings(
     max_attempts: int,
     retry_delay_seconds: float,
 ) -> None:
-    """Die Konfiguration prüfen, bevor die erste HTTP-Anfrage gesendet wird.
-
-    Eine ungültige Anzahl von Versuchen würde sonst dazu führen, dass die Schleife
-    gar nicht ausgeführt wird. Eine negative Wartezeit würde erst später und mit
-    einer weniger verständlichen Meldung in ``time.sleep`` fehlschlagen.
-    """
+    """Die Retry-Konfiguration vor der ersten HTTP-Anfrage prüfen."""
     if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
         raise ValueError("max_attempts must be a positive integer.")
 
-    # ``int`` ist hier ebenfalls erlaubt, weil beispielsweise ``0`` eine sinnvolle
-    # Wartezeit in einem Test sein kann. Boolesche Werte schließen wir wie bei der
-    # Pokémon-ID ausdrücklich aus.
     if (
         not isinstance(retry_delay_seconds, (int, float))
         or isinstance(retry_delay_seconds, bool)
@@ -110,14 +111,34 @@ def _retry_delay(
     failed_attempt: int,
     base_delay_seconds: float,
 ) -> float:
-    """Die Wartezeit für exponentiellen Backoff berechnen.
-
-    Beim ersten Fehlschlag ist der Exponent null: ``0.5 * 2**0 == 0.5``.
-    Beim zweiten Fehlschlag ergibt sich: ``0.5 * 2**1 == 1.0``.
-    """
-    # ``2.0`` statt ``2`` hält das Ergebnis auch für den statischen Typprüfer
-    # eindeutig im Gleitkomma-Bereich.
+    """Die Wartezeit für exponentiellen Backoff berechnen."""
+    # Beim ersten Fehlschlag: 0.5 * 2**0 = 0.5 Sekunden.
+    # Beim zweiten Fehlschlag: 0.5 * 2**1 = 1.0 Sekunde.
     return base_delay_seconds * 2.0 ** (failed_attempt - 1)
+
+
+def _validate_unique_pokemon_ids(pokemon_ids: Iterable[int]) -> list[int]:
+    """Pokémon-IDs vollständig prüfen und Duplikate geordnet entfernen.
+
+    Die Funktion verarbeitet das gesamte Iterable, bevor die Batch-Sammlung eine
+    Netzwerkanfrage startet. Enthält die Eingabe beispielsweise ``[1, 0, 2]``, wird
+    also nicht erst Pokémon 1 gespeichert und danach wegen der ungültigen 0
+    abgebrochen.
+
+    Ein ``set`` ermöglicht eine schnelle Duplikatprüfung. Die zusätzliche Liste ist
+    trotzdem nötig, weil Sets keine verlässliche fachliche Reihenfolge ausdrücken.
+    """
+    validated_ids: list[int] = []
+    seen_ids: set[int] = set()
+
+    for pokemon_id in pokemon_ids:
+        validated_id = _validate_pokemon_id(pokemon_id)
+
+        if validated_id not in seen_ids:
+            seen_ids.add(validated_id)
+            validated_ids.append(validated_id)
+
+    return validated_ids
 
 
 def create_http_client(
@@ -126,22 +147,8 @@ def create_http_client(
 ) -> httpx.Client:
     """Einen einheitlich konfigurierten HTTPX-Client erzeugen.
 
-    Die Funktion bündelt technische Einstellungen an einer Stelle. Dadurch nutzt
-    ein späterer Sammellauf nicht versehentlich an verschiedenen Stellen andere
-    Timeout- oder Header-Werte.
-
     Der zurückgegebene Client sollte als Context Manager verwendet werden:
-
-    ``with create_http_client() as client:``
-
-    Args:
-        timeout_seconds: Maximale Inaktivitätsdauer eines Netzwerkschritts.
-
-    Returns:
-        Einen HTTPX-Client mit Timeout, Redirect-Unterstützung und User-Agent.
-
-    Raises:
-        ValueError: Wenn der Timeout nicht größer als null ist.
+    ``with create_http_client() as client:``.
     """
     if (
         not isinstance(timeout_seconds, (int, float))
@@ -174,8 +181,7 @@ def fetch_pokemon(
             ermöglicht schnelle Tests mit ``MockTransport`` ohne Internetzugriff.
         max_attempts: Gesamtzahl der Versuche einschließlich der ersten Anfrage.
         retry_delay_seconds: Basiswartezeit für den exponentiellen Backoff.
-        sleep: Funktion zum Warten. Der Standard ist ``time.sleep``; Tests können
-            eine Funktion ohne echte Verzögerung einsetzen.
+        sleep: Funktion zum Warten; Tests injizieren eine Funktion ohne Verzögerung.
 
     Returns:
         Die vollständige JSON-Antwort als Dictionary.
@@ -193,8 +199,6 @@ def fetch_pokemon(
     )
     url = f"{POKEAPI_BASE_URL}/pokemon/{identifier}/"
 
-    # ``range`` endet vor dem zweiten Grenzwert. Mit ``+ 1`` erhalten wir daher
-    # verständliche Versuchsnummern von 1 bis einschließlich ``max_attempts``.
     for attempt in range(1, max_attempts + 1):
         try:
             response = client.get(url)
@@ -203,10 +207,8 @@ def fetch_pokemon(
             httpx.NetworkError,
             httpx.RemoteProtocolError,
         ) as error:
-            # Zeitüberschreitungen, Netzwerkfehler und vorübergehende
-            # Protokollabbrüche können beim nächsten Versuch bereits verschwunden
-            # sein. Nach dem letzten Versuch geben wir den Originalfehler weiter,
-            # damit der aufrufende Code Ursache und Traceback vollständig erhält.
+            # Nach dem letzten Versuch geben wir den Originalfehler samt Traceback
+            # weiter. So bleibt die technische Ursache vollständig sichtbar.
             if attempt == max_attempts:
                 raise
 
@@ -224,15 +226,10 @@ def fetch_pokemon(
             sleep(delay)
             continue
 
-        # Für 404 verwenden wir eine fachliche Exception. Dieser Fehler wird nicht
-        # wiederholt, weil derselbe unbekannte Name oder dieselbe unbekannte ID bei
-        # einer zweiten Anfrage mit hoher Wahrscheinlichkeit wieder scheitert.
+        # 404 ist ein fachlich eindeutiger Fehler und wird nicht wiederholt.
         if response.status_code == httpx.codes.NOT_FOUND:
             raise PokemonNotFoundError(f"Pokémon '{identifier}' was not found.")
 
-        # Nur die oben festgelegten temporären HTTP-Statuscodes lösen einen neuen
-        # Versuch aus. Andere 4xx-Fehler, beispielsweise 400, weisen auf eine
-        # fehlerhafte Anfrage hin und würden durch Warten nicht behoben.
         if response.status_code in RETRYABLE_STATUS_CODES and attempt < max_attempts:
             delay = _retry_delay(
                 failed_attempt=attempt,
@@ -248,24 +245,16 @@ def fetch_pokemon(
             sleep(delay)
             continue
 
-        # Beim letzten temporären Fehler und bei allen nicht wiederholbaren
-        # Fehlerstatus löst HTTPX hier eine aussagekräftige HTTPStatusError aus.
+        # Beim letzten temporären Fehler und bei allen permanenten Fehlerstatus
+        # erzeugt HTTPX hier eine aussagekräftige HTTPStatusError.
         response.raise_for_status()
 
-        # ``response.json()`` besitzt aus Sicht des Typprüfers einen sehr allgemeinen
-        # Rückgabetyp. Die Laufzeitprüfung schützt unsere Funktion vor Listen, Strings
-        # oder anderen unerwarteten JSON-Werten an der obersten Ebene.
         payload: object = response.json()
         if not isinstance(payload, dict):
             raise ValueError("PokéAPI response must be a JSON object.")
 
-        # ``cast`` verändert den Wert zur Laufzeit nicht. Es informiert nur mypy
-        # darüber, dass JSON-Objektschlüssel laut JSON-Standard Strings sind.
         return cast(JsonObject, payload)
 
-    # Dieser Zustand ist durch die vorherige Validierung von ``max_attempts`` nicht
-    # erreichbar. Die explizite Exception hilft sowohl Menschen als auch mypy dabei,
-    # zu erkennen, dass die Funktion in jedem realen Pfad endet.
     raise AssertionError("Unreachable retry state.")
 
 
@@ -350,3 +339,48 @@ def collect_pokemon(
     # jeweiligen Funktionen gekapselt. Das erleichtert Tests und spätere Änderungen.
     payload = fetch_pokemon(validated_id, client=client)
     return cache_pokemon_response(payload, directory=directory)
+
+
+def collect_pokemon_batch(
+    pokemon_ids: Iterable[int],
+    *,
+    client: httpx.Client,
+    directory: Path,
+) -> list[Path]:
+    """Mehrere Pokémon sequenziell sammeln und ihre Cache-Pfade zurückgeben.
+
+    Diese Funktion führt absichtlich keine parallelen HTTP-Anfragen aus. Ein
+    sequenzieller Ablauf ist leichter nachvollziehbar, schont die kostenlose API
+    und reicht für den einmaligen Aufbau unseres MVP-Datensatzes aus.
+
+    Args:
+        pokemon_ids: Positive IDs. Duplikate werden bei erhaltener Reihenfolge
+            entfernt.
+        client: Gemeinsamer HTTPX-Client für alle möglicherweise nötigen Abrufe.
+        directory: Zielverzeichnis der lokalen Rohdaten.
+
+    Returns:
+        Cache-Pfade in derselben Reihenfolge wie die eindeutigen Eingabe-IDs.
+
+    Raises:
+        ValueError: Wenn mindestens eine ID ungültig ist. Die Prüfung erfolgt vor
+            dem ersten API-Abruf.
+        PokemonNotFoundError: Wenn eine ID nicht existiert.
+        httpx.HTTPError: Wenn ein HTTP- oder Netzwerkfehler endgültig fehlschlägt.
+
+    Bereits erfolgreich gespeicherte Dateien bleiben bei einem späteren Fehler
+    erhalten. Ein erneuter Lauf überspringt sie durch den bestehenden Cache und
+    kann dadurch effizient fortsetzen.
+    """
+    validated_ids = _validate_unique_pokemon_ids(pokemon_ids)
+
+    collected_paths: list[Path] = []
+    for pokemon_id in validated_ids:
+        path = collect_pokemon(
+            pokemon_id,
+            client=client,
+            directory=directory,
+        )
+        collected_paths.append(path)
+
+    return collected_paths
