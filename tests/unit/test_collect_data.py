@@ -13,6 +13,7 @@ from pokemon_team_advisor.collect_data import (
     collect_pokemon_batch,
     create_http_client,
     fetch_pokemon,
+    fetch_pokemon_ids,
 )
 
 
@@ -158,6 +159,120 @@ def test_fetch_pokemon_validates_retry_settings_before_request() -> None:
 
         with pytest.raises(ValueError, match="retry_delay_seconds"):
             fetch_pokemon(1, client=client, retry_delay_seconds=-0.1)
+
+
+def test_fetch_pokemon_ids_follows_pagination_and_uses_resource_urls() -> None:
+    requested_offsets: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        offset = request.url.params.get("offset")
+        assert offset is not None
+        requested_offsets.append(offset)
+
+        if offset == "0":
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "count": 3,
+                    "next": "https://pokeapi.co/api/v2/pokemon/?limit=2&offset=2",
+                    "previous": None,
+                    "results": [
+                        {
+                            "name": "bulbasaur",
+                            "url": "https://pokeapi.co/api/v2/pokemon/1/",
+                        },
+                        {
+                            "name": "deoxys-normal",
+                            "url": "https://pokeapi.co/api/v2/pokemon/10001/",
+                        },
+                    ],
+                },
+            )
+
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "count": 3,
+                "next": None,
+                "previous": "https://pokeapi.co/api/v2/pokemon/?limit=2&offset=0",
+                "results": [
+                    {
+                        "name": "charmander",
+                        "url": "https://pokeapi.co/api/v2/pokemon/4/",
+                    }
+                ],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        pokemon_ids = fetch_pokemon_ids(client=client, page_size=2)
+
+    # Die hohe Form-ID beweist, dass wir nicht von einem lückenlosen numerischen
+    # Bereich oder einer fest verdrahteten maximalen ID ausgehen.
+    assert pokemon_ids == [1, 10001, 4]
+    assert requested_offsets == ["0", "2"]
+
+
+def test_fetch_pokemon_ids_validates_page_size_before_request() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"Unexpected API request: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(ValueError, match="page_size"):
+            fetch_pokemon_ids(client=client, page_size=0)
+
+
+def test_fetch_pokemon_ids_rejects_duplicate_resource_id() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "count": 2,
+                "next": None,
+                "previous": None,
+                "results": [
+                    {"url": "https://pokeapi.co/api/v2/pokemon/1/"},
+                    {"url": "https://pokeapi.co/api/v2/pokemon/1/"},
+                ],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(ValueError, match="Duplicate Pokémon resource ID: 1"):
+            fetch_pokemon_ids(client=client)
+
+
+def test_fetch_pokemon_ids_rejects_pagination_cycle() -> None:
+    first_url = "https://pokeapi.co/api/v2/pokemon/?limit=2&offset=0"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "count": 2,
+                "next": first_url,
+                "previous": None,
+                "results": [
+                    {"url": "https://pokeapi.co/api/v2/pokemon/1/"},
+                ],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(ValueError, match="pagination contains a cycle"):
+            fetch_pokemon_ids(client=client, page_size=2)
 
 
 def test_create_http_client_configures_timeout_and_user_agent(

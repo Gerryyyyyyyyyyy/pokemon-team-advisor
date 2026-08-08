@@ -25,6 +25,11 @@ DEFAULT_MAX_ATTEMPTS = 3
 # exponentiellen Backoff wird daraus vor dem dritten Versuch 1,0 Sekunde.
 DEFAULT_RETRY_DELAY_SECONDS = 0.5
 
+# Die PokéAPI liefert Listen standardmäßig in sehr kleinen Seiten. Für unsere
+# einmalige Ressourcen-Ermittlung sind 200 Einträge pro Seite ein guter Kompromiss:
+# wenige Index-Anfragen, ohne von einer künstlich riesigen Einzelseite auszugehen.
+DEFAULT_RESOURCE_PAGE_SIZE = 200
+
 # Nur Statuscodes, die typischerweise einen vorübergehenden Zustand beschreiben,
 # werden wiederholt. 429 steht für zu viele Anfragen; die ausgewählten 5xx-Codes
 # beschreiben temporäre Probleme bei der API oder einem vorgeschalteten Dienst.
@@ -164,6 +169,85 @@ def create_http_client(
     )
 
 
+def _get_with_retries(
+    url: str,
+    *,
+    client: httpx.Client,
+    max_attempts: int,
+    retry_delay_seconds: float,
+    sleep: Sleeper,
+) -> httpx.Response:
+    """Eine GET-Anfrage mit unserer zentralen Retry-Strategie ausführen.
+
+    Sowohl ein einzelnes Pokémon als auch die paginierte Ressourcenliste benötigen
+    dieselbe technische Fehlerbehandlung. Diese private Funktion verhindert, dass
+    Timeout-, Backoff- und Statuscode-Regeln an zwei Stellen auseinanderlaufen.
+
+    Die Funktion gibt auch eine endgültige Fehlerantwort zurück. Dadurch kann der
+    aufrufende fachliche Code unterscheiden, ob beispielsweise ein 404 bei einem
+    Pokémon als ``PokemonNotFoundError`` übersetzt werden soll.
+    """
+    _validate_retry_settings(
+        max_attempts=max_attempts,
+        retry_delay_seconds=retry_delay_seconds,
+    )
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.get(url)
+        except (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+        ) as error:
+            if attempt == max_attempts:
+                raise
+
+            delay = _retry_delay(
+                failed_attempt=attempt,
+                base_delay_seconds=retry_delay_seconds,
+            )
+            LOGGER.warning(
+                "Temporärer PokéAPI-Fehler %s; Versuch %s von %s in %.1f Sekunden.",
+                type(error).__name__,
+                attempt + 1,
+                max_attempts,
+                delay,
+            )
+            sleep(delay)
+            continue
+
+        if response.status_code in RETRYABLE_STATUS_CODES and attempt < max_attempts:
+            delay = _retry_delay(
+                failed_attempt=attempt,
+                base_delay_seconds=retry_delay_seconds,
+            )
+            LOGGER.warning(
+                "PokéAPI antwortete mit HTTP %s; Versuch %s von %s in %.1f Sekunden.",
+                response.status_code,
+                attempt + 1,
+                max_attempts,
+                delay,
+            )
+            sleep(delay)
+            continue
+
+        return response
+
+    # ``max_attempts`` ist vorher als mindestens 1 validiert. Dieser Zustand ist
+    # deshalb nur eine Schutzklausel für Typprüfer und zukünftige Änderungen.
+    raise AssertionError("Unreachable retry state.")
+
+
+def _response_json_object(response: httpx.Response) -> JsonObject:
+    """Den Response-Body als JSON-Objekt validieren und typisiert zurückgeben."""
+    payload: object = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("PokéAPI response must be a JSON object.")
+
+    return cast(JsonObject, payload)
+
+
 def fetch_pokemon(
     identifier: int | str,
     *,
@@ -193,69 +277,126 @@ def fetch_pokemon(
             letzten Versuch auftritt.
         ValueError: Wenn die Antwort an der obersten Ebene kein JSON-Objekt ist.
     """
-    _validate_retry_settings(
+    url = f"{POKEAPI_BASE_URL}/pokemon/{identifier}/"
+    response = _get_with_retries(
+        url,
+        client=client,
         max_attempts=max_attempts,
         retry_delay_seconds=retry_delay_seconds,
+        sleep=sleep,
     )
-    url = f"{POKEAPI_BASE_URL}/pokemon/{identifier}/"
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = client.get(url)
-        except (
-            httpx.TimeoutException,
-            httpx.NetworkError,
-            httpx.RemoteProtocolError,
-        ) as error:
-            # Nach dem letzten Versuch geben wir den Originalfehler samt Traceback
-            # weiter. So bleibt die technische Ursache vollständig sichtbar.
-            if attempt == max_attempts:
-                raise
+    # 404 ist bei einem konkreten Pokémon eine fachlich eindeutige Antwort und wird
+    # deshalb in unsere eigene Exception übersetzt.
+    if response.status_code == httpx.codes.NOT_FOUND:
+        raise PokemonNotFoundError(f"Pokémon '{identifier}' was not found.")
 
-            delay = _retry_delay(
-                failed_attempt=attempt,
-                base_delay_seconds=retry_delay_seconds,
-            )
-            LOGGER.warning(
-                "Temporärer PokéAPI-Fehler %s; Versuch %s von %s in %.1f Sekunden.",
-                type(error).__name__,
-                attempt + 1,
-                max_attempts,
-                delay,
-            )
-            sleep(delay)
-            continue
+    response.raise_for_status()
+    return _response_json_object(response)
 
-        # 404 ist ein fachlich eindeutiger Fehler und wird nicht wiederholt.
-        if response.status_code == httpx.codes.NOT_FOUND:
-            raise PokemonNotFoundError(f"Pokémon '{identifier}' was not found.")
 
-        if response.status_code in RETRYABLE_STATUS_CODES and attempt < max_attempts:
-            delay = _retry_delay(
-                failed_attempt=attempt,
-                base_delay_seconds=retry_delay_seconds,
-            )
-            LOGGER.warning(
-                "PokéAPI antwortete mit HTTP %s; Versuch %s von %s in %.1f Sekunden.",
-                response.status_code,
-                attempt + 1,
-                max_attempts,
-                delay,
-            )
-            sleep(delay)
-            continue
+def _pokemon_id_from_resource_url(resource_url: object) -> int:
+    """Eine numerische Pokémon-ID aus einer PokéAPI-Resource-URL lesen.
 
-        # Beim letzten temporären Fehler und bei allen permanenten Fehlerstatus
-        # erzeugt HTTPX hier eine aussagekräftige HTTPStatusError.
+    Wir verwenden die von der API gelieferten URLs statt ``range(1, max_id)``.
+    Dadurch funktionieren auch Ressourcen mit hohen Form-IDs und mögliche Lücken
+    im ID-Raum, ohne dass wir sie erraten müssen.
+    """
+    if not isinstance(resource_url, str) or not resource_url:
+        raise ValueError("Pokémon resource URL must be a non-empty string.")
+
+    path_parts = httpx.URL(resource_url).path.strip("/").split("/")
+    if len(path_parts) < 2 or path_parts[-2] != "pokemon":
+        raise ValueError(f"Unexpected Pokémon resource URL: {resource_url}")
+
+    try:
+        pokemon_id = int(path_parts[-1])
+    except ValueError as error:
+        raise ValueError(f"Pokémon resource URL has no numeric ID: {resource_url}") from error
+
+    return _validate_pokemon_id(pokemon_id)
+
+
+def fetch_pokemon_ids(
+    *,
+    client: httpx.Client,
+    page_size: int = DEFAULT_RESOURCE_PAGE_SIZE,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
+    sleep: Sleeper = time.sleep,
+) -> list[int]:
+    """Alle aktuell gelisteten Pokémon-Resource-IDs paginiert ermitteln.
+
+    Die PokéAPI liefert neben Standard-Pokémon auch alternative Formen als eigene
+    Pokémon-Ressourcen. Wir sammeln zunächst alle von der API gemeldeten IDs. Der
+    bereits getestete ``is_default``-Filter in ``prepare_data.py`` entscheidet erst
+    später, welche davon in den MVP-Datensatz gelangen.
+
+    Die Funktion folgt dem ``next``-Link der API, prüft eine konstante Gesamtzahl
+    über alle Seiten und erkennt doppelte IDs oder zyklische Pagination als
+    Datenfehler. Damit wird eine unvollständige Liste nicht still akzeptiert.
+    """
+    if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0:
+        raise ValueError("page_size must be a positive integer.")
+
+    next_url: str | None = f"{POKEAPI_BASE_URL}/pokemon/?limit={page_size}&offset=0"
+    expected_count: int | None = None
+    pokemon_ids: list[int] = []
+    seen_ids: set[int] = set()
+    visited_pages: set[str] = set()
+
+    while next_url is not None:
+        if next_url in visited_pages:
+            raise ValueError(f"PokéAPI pagination contains a cycle: {next_url}")
+        visited_pages.add(next_url)
+
+        response = _get_with_retries(
+            next_url,
+            client=client,
+            max_attempts=max_attempts,
+            retry_delay_seconds=retry_delay_seconds,
+            sleep=sleep,
+        )
         response.raise_for_status()
+        payload = _response_json_object(response)
 
-        payload: object = response.json()
-        if not isinstance(payload, dict):
-            raise ValueError("PokéAPI response must be a JSON object.")
+        count = payload.get("count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("PokéAPI resource count must be a non-negative integer.")
+        if expected_count is None:
+            expected_count = count
+        elif count != expected_count:
+            raise ValueError("PokéAPI resource count changed during pagination.")
 
-        return cast(JsonObject, payload)
+        results = payload.get("results")
+        if not isinstance(results, list):
+            raise ValueError("PokéAPI resource results must be a JSON list.")
 
-    raise AssertionError("Unreachable retry state.")
+        for index, raw_resource in enumerate(results):
+            if not isinstance(raw_resource, dict):
+                raise ValueError(f"PokéAPI resource results[{index}] must be a JSON object.")
+
+            pokemon_id = _pokemon_id_from_resource_url(raw_resource.get("url"))
+            if pokemon_id in seen_ids:
+                raise ValueError(f"Duplicate Pokémon resource ID: {pokemon_id}.")
+
+            seen_ids.add(pokemon_id)
+            pokemon_ids.append(pokemon_id)
+
+        raw_next = payload.get("next")
+        if raw_next is not None and not isinstance(raw_next, str):
+            raise ValueError("PokéAPI resource next link must be a string or null.")
+        next_url = raw_next
+
+    # Ein ``next = null`` allein beweist nicht, dass alle Ressourcen angekommen
+    # sind. Der Abgleich mit ``count`` erkennt auch eine zu früh beendete Liste.
+    if expected_count is None or len(pokemon_ids) != expected_count:
+        raise ValueError(
+            "PokéAPI resource list is incomplete: "
+            f"expected {expected_count}, received {len(pokemon_ids)}."
+        )
+
+    return pokemon_ids
 
 
 def cache_pokemon_response(
