@@ -11,9 +11,14 @@ reproduzierbare Quelle erhalten, während sich die fachliche Transformation spä
 
 import csv
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TypedDict, cast
+
+from pokemon_team_advisor.evolution import (
+    EvolutionFeatures,
+    prepare_evolution_directory,
+)
 
 # Diese sechs Werte bilden das Stat-Schema unseres MVP. Wir greifen später über den
 # Namen darauf zu und nicht über die Position in der PokéAPI-Liste. Dadurch wäre
@@ -34,6 +39,7 @@ EXPECTED_STAT_NAMES = frozenset(
 PROCESSED_COLUMNS = (
     "id",
     "name",
+    "species_name",
     "is_default",
     "type_1",
     "type_2",
@@ -44,6 +50,12 @@ PROCESSED_COLUMNS = (
     "special_defense",
     "speed",
     "base_stat_total",
+    "generation",
+    "evolution_chain_id",
+    "evolution_family",
+    "evolution_stage",
+    "evolution_max_stage",
+    "is_final_evolution",
     "sprite_url",
 )
 
@@ -51,7 +63,7 @@ type JsonObject = dict[str, object]
 
 
 class PokemonRecord(TypedDict):
-    """Das flache Datenschema eines Standard-Pokémon im MVP.
+    """Die aus der Pokémon-Ressource gelesenen Basismerkmale.
 
     ``TypedDict`` gibt uns die Lesbarkeit eines normalen Dictionaries, lässt mypy
     aber trotzdem kontrollieren, ob Schlüssel und Werttypen stimmen. Das passt hier
@@ -60,6 +72,7 @@ class PokemonRecord(TypedDict):
 
     id: int
     name: str
+    species_name: str
     is_default: bool
     type_1: str
     type_2: str | None
@@ -71,6 +84,17 @@ class PokemonRecord(TypedDict):
     speed: int
     base_stat_total: int
     sprite_url: str | None
+
+
+class PokemonDatasetRecord(PokemonRecord):
+    """Ein Pokémon-Datensatz nach dem Join mit den Evolutionsmerkmalen."""
+
+    generation: int
+    evolution_chain_id: int
+    evolution_family: str
+    evolution_stage: int
+    evolution_max_stage: int
+    is_final_evolution: bool
 
 
 def _require_object(value: object, *, field: str) -> JsonObject:
@@ -193,6 +217,18 @@ def _extract_sprite_url(payload: JsonObject) -> str | None:
     return _require_string(sprite_url, field="sprites.front_default")
 
 
+def _extract_species_name(payload: JsonObject) -> str:
+    """Den Species-Namen als stabilen Schlüssel für den späteren Join lesen.
+
+    Der Name einer Pokémon-Ressource ist nicht immer mit dem Species-Namen
+    identisch. Beispielsweise heißt die Standardform in der Pokémon-Ressource
+    ``wormadam-plant``, während ihre Species ``wormadam`` heißt. Deshalb darf der
+    Evolutions-Join nicht unmittelbar über ``pokemon.name`` erfolgen.
+    """
+    species = _require_object(payload.get("species"), field="species")
+    return _require_string(species.get("name"), field="species.name")
+
+
 def prepare_pokemon(payload: JsonObject) -> PokemonRecord | None:
     """Eine rohe PokéAPI-Antwort in einen MVP-Datensatz transformieren.
 
@@ -210,6 +246,7 @@ def prepare_pokemon(payload: JsonObject) -> PokemonRecord | None:
 
     pokemon_id = _require_positive_int(payload.get("id"), field="id")
     name = _require_string(payload.get("name"), field="name")
+    species_name = _extract_species_name(payload)
     type_1, type_2 = _extract_types(payload)
     stats = _extract_stats(payload)
     sprite_url = _extract_sprite_url(payload)
@@ -222,6 +259,7 @@ def prepare_pokemon(payload: JsonObject) -> PokemonRecord | None:
     return PokemonRecord(
         id=pokemon_id,
         name=name,
+        species_name=species_name,
         is_default=is_default,
         type_1=type_1,
         type_2=type_2,
@@ -268,8 +306,55 @@ def prepare_raw_directory(raw_directory: Path) -> list[PokemonRecord]:
     return records
 
 
-def write_processed_csv(
+def add_evolution_features(
     records: Iterable[PokemonRecord],
+    *,
+    features_by_species: Mapping[str, EvolutionFeatures],
+) -> list[PokemonDatasetRecord]:
+    """Pokémon-Datensätze über den Species-Namen um Evolution ergänzen.
+
+    Args:
+        records: Bereits aufbereitete Standard-Pokémon.
+        features_by_species: Evolutionsmerkmale, deren Schlüssel die Namen der
+            Pokémon-Species sind.
+
+    Returns:
+        Neue Datensätze, die Basis- und Evolutionsmerkmale enthalten. Die
+        übergebenen Basisdatensätze werden nicht verändert.
+
+    Raises:
+        ValueError: Wenn zu einem Pokémon keine Species-Merkmale vorhanden sind.
+            Ein unvollständiger Join würde sonst unbemerkt fehlende Werte in den
+            Processed-Datensatz bringen.
+    """
+    enriched_records: list[PokemonDatasetRecord] = []
+
+    for record in records:
+        species_name = record["species_name"]
+        if species_name not in features_by_species:
+            raise ValueError(
+                "Missing evolution features for Pokémon "
+                f"'{record['name']}' with species '{species_name}'."
+            )
+
+        features = features_by_species[species_name]
+        enriched_records.append(
+            PokemonDatasetRecord(
+                **record,
+                generation=features["generation"],
+                evolution_chain_id=features["evolution_chain_id"],
+                evolution_family=features["evolution_family"],
+                evolution_stage=features["evolution_stage"],
+                evolution_max_stage=features["evolution_max_stage"],
+                is_final_evolution=features["is_final_evolution"],
+            )
+        )
+
+    return enriched_records
+
+
+def write_processed_csv(
+    records: Iterable[PokemonDatasetRecord],
     *,
     output_path: Path,
 ) -> Path:
@@ -298,9 +383,15 @@ def write_processed_csv(
 def prepare_dataset(
     *,
     raw_directory: Path,
+    species_raw_directory: Path,
     output_path: Path,
-) -> list[PokemonRecord]:
-    """Rohdaten aufbereiten, als CSV speichern und die Datensätze zurückgeben."""
+) -> list[PokemonDatasetRecord]:
+    """Pokémon und Species aufbereiten, verbinden und als CSV speichern."""
     records = prepare_raw_directory(raw_directory)
-    write_processed_csv(records, output_path=output_path)
-    return records
+    features_by_species = prepare_evolution_directory(species_raw_directory)
+    enriched_records = add_evolution_features(
+        records,
+        features_by_species=features_by_species,
+    )
+    write_processed_csv(enriched_records, output_path=output_path)
+    return enriched_records

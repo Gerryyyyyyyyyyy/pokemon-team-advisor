@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from pokemon_team_advisor.evolution import EvolutionFeatures
 from pokemon_team_advisor.prepare_data import (
+    add_evolution_features,
     prepare_dataset,
     prepare_pokemon,
     prepare_raw_directory,
@@ -17,13 +19,21 @@ def _pokemon_payload(
     *,
     pokemon_id: int = 1,
     name: str = "bulbasaur",
+    species_name: str | None = None,
     is_default: bool = True,
 ) -> dict[str, object]:
     """Kleinen realistischen PokéAPI-Payload für mehrere Tests erzeugen."""
+    if species_name is None:
+        species_name = name
+
     return {
         "id": pokemon_id,
         "name": name,
         "is_default": is_default,
+        "species": {
+            "name": species_name,
+            "url": (f"https://pokeapi.co/api/v2/pokemon-species/{pokemon_id}/"),
+        },
         # Die Typen stehen absichtlich in umgekehrter Listenreihenfolge. Damit
         # beweist der Test später, dass unsere Logik den API-Slot verwendet.
         "types": [
@@ -51,12 +61,60 @@ def _write_payload(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _species_payload(
+    *,
+    name: str = "bulbasaur",
+    evolves_from: str | None = None,
+    chain_id: int = 1,
+    generation: int = 1,
+) -> dict[str, object]:
+    """Kleine Species-Antwort für den Integrationstest erzeugen."""
+    parent: dict[str, object] | None
+    if evolves_from is None:
+        parent = None
+    else:
+        parent = {
+            "name": evolves_from,
+            "url": f"https://pokeapi.co/api/v2/pokemon-species/{evolves_from}/",
+        }
+
+    return {
+        "name": name,
+        "evolves_from_species": parent,
+        "evolution_chain": {
+            "url": f"https://pokeapi.co/api/v2/evolution-chain/{chain_id}/",
+        },
+        "generation": {
+            "url": f"https://pokeapi.co/api/v2/generation/{generation}/",
+        },
+    }
+
+
+def _evolution_features(
+    *,
+    family: str = "bulbasaur",
+    stage: int = 0,
+    max_stage: int = 2,
+    is_final: bool = False,
+) -> EvolutionFeatures:
+    """Vollständige Evolutionsmerkmale kompakt für Join-Tests erzeugen."""
+    return {
+        "evolution_chain_id": 1,
+        "evolution_family": family,
+        "evolution_stage": stage,
+        "evolution_max_stage": max_stage,
+        "is_final_evolution": is_final,
+        "generation": 1,
+    }
+
+
 def test_prepare_pokemon_extracts_mvp_fields_by_name_and_slot() -> None:
     record = prepare_pokemon(_pokemon_payload())
 
     assert record == {
         "id": 1,
         "name": "bulbasaur",
+        "species_name": "bulbasaur",
         "is_default": True,
         "type_1": "grass",
         "type_2": "poison",
@@ -69,6 +127,21 @@ def test_prepare_pokemon_extracts_mvp_fields_by_name_and_slot() -> None:
         "base_stat_total": 318,
         "sprite_url": "https://example.test/sprites/1.png",
     }
+
+
+def test_prepare_pokemon_extracts_species_name_as_join_key() -> None:
+    """Pokémon-Form und Species dürfen unterschiedliche Namen besitzen."""
+    payload = _pokemon_payload(
+        pokemon_id=413,
+        name="wormadam-plant",
+        species_name="wormadam",
+    )
+
+    record = prepare_pokemon(payload)
+
+    assert record is not None
+    assert record["name"] == "wormadam-plant"
+    assert record["species_name"] == "wormadam"
 
 
 def test_prepare_pokemon_supports_single_type_and_missing_sprite() -> None:
@@ -155,14 +228,63 @@ def test_prepare_raw_directory_requires_existing_directory(tmp_path: Path) -> No
         prepare_raw_directory(tmp_path / "missing")
 
 
+def test_add_evolution_features_joins_by_species_name() -> None:
+    """Der Join verwendet die Species und nicht den abweichenden Formnamen."""
+    record = prepare_pokemon(
+        _pokemon_payload(
+            pokemon_id=413,
+            name="wormadam-plant",
+            species_name="wormadam",
+        )
+    )
+    assert record is not None
+    features_by_species = {
+        "wormadam": _evolution_features(
+            family="burmy",
+            stage=1,
+            max_stage=1,
+            is_final=True,
+        )
+    }
+
+    enriched = add_evolution_features(
+        [record],
+        features_by_species=features_by_species,
+    )
+
+    assert enriched[0]["name"] == "wormadam-plant"
+    assert enriched[0]["species_name"] == "wormadam"
+    assert enriched[0]["evolution_family"] == "burmy"
+    assert enriched[0]["evolution_stage"] == 1
+    assert enriched[0]["is_final_evolution"] is True
+
+
+def test_add_evolution_features_rejects_missing_species() -> None:
+    """Einen unvollständigen Join nicht mit leeren Werten verschleiern."""
+    record = prepare_pokemon(_pokemon_payload())
+    assert record is not None
+
+    with pytest.raises(ValueError, match="Missing evolution features.*bulbasaur"):
+        add_evolution_features([record], features_by_species={})
+
+
 def test_prepare_dataset_writes_deterministic_csv(tmp_path: Path) -> None:
     raw_directory = tmp_path / "raw"
     raw_directory.mkdir()
     _write_payload(raw_directory / "0001.json", _pokemon_payload())
+
+    species_raw_directory = tmp_path / "species"
+    species_raw_directory.mkdir()
+    _write_payload(
+        species_raw_directory / "0001.json",
+        _species_payload(),
+    )
+
     output_path = tmp_path / "processed" / "pokemon.csv"
 
     records = prepare_dataset(
         raw_directory=raw_directory,
+        species_raw_directory=species_raw_directory,
         output_path=output_path,
     )
 
@@ -174,5 +296,12 @@ def test_prepare_dataset_writes_deterministic_csv(tmp_path: Path) -> None:
     assert rows[0]["type_1"] == "grass"
     assert rows[0]["type_2"] == "poison"
     assert rows[0]["base_stat_total"] == "318"
+    assert rows[0]["species_name"] == "bulbasaur"
+    assert rows[0]["generation"] == "1"
+    assert rows[0]["evolution_chain_id"] == "1"
+    assert rows[0]["evolution_family"] == "bulbasaur"
+    assert rows[0]["evolution_stage"] == "0"
+    assert rows[0]["evolution_max_stage"] == "0"
+    assert rows[0]["is_final_evolution"] == "True"
     assert output_path.read_bytes().endswith(b"\n")
     assert not output_path.with_suffix(".csv.tmp").exists()
