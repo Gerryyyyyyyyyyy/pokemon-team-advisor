@@ -8,13 +8,187 @@ import pytest
 
 from pokemon_team_advisor.collect_data import (
     PokemonNotFoundError,
+    PokemonSpeciesNotFoundError,
     cache_pokemon_response,
+    cache_pokemon_species_response,
     collect_pokemon,
     collect_pokemon_batch,
+    collect_pokemon_species,
+    collect_pokemon_species_batch,
     create_http_client,
     fetch_pokemon,
     fetch_pokemon_ids,
+    fetch_pokemon_species,
+    fetch_pokemon_species_ids,
 )
+
+
+def test_fetch_pokemon_species_returns_json_payload() -> None:
+    expected = {
+        "id": 2,
+        "name": "ivysaur",
+        "evolves_from_species": {"name": "bulbasaur"},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://pokeapi.co/api/v2/pokemon-species/2/"
+        return httpx.Response(200, request=request, json=expected)
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        result = fetch_pokemon_species(2, client=client)
+
+    assert result == expected
+
+
+def test_fetch_pokemon_species_raises_clear_error_for_missing_species() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(404, request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(PokemonSpeciesNotFoundError, match="missing-species"):
+            fetch_pokemon_species("missing-species", client=client)
+
+    assert len(requests) == 1
+
+
+def test_cache_pokemon_species_response_writes_json(tmp_path: Path) -> None:
+    payload = {"id": 2, "name": "ivysaur"}
+    directory = tmp_path / "pokemon_species"
+
+    output_path = cache_pokemon_species_response(payload, directory=directory)
+
+    assert output_path == directory / "0002.json"
+    assert json.loads(output_path.read_text(encoding="utf-8")) == payload
+
+
+def test_collect_pokemon_species_uses_existing_cache(tmp_path: Path) -> None:
+    payload = {"id": 2, "name": "ivysaur"}
+    cached_path = cache_pokemon_species_response(payload, directory=tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"Unexpected API request: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        result = collect_pokemon_species(2, client=client, directory=tmp_path)
+
+    assert result == cached_path
+
+
+def test_collect_pokemon_species_batch_preserves_order_and_removes_duplicates(
+    tmp_path: Path,
+) -> None:
+    requested_ids: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        species_id = int(request.url.path.rstrip("/").split("/")[-1])
+        requested_ids.append(species_id)
+        return httpx.Response(
+            200,
+            request=request,
+            json={"id": species_id, "name": f"species-{species_id}"},
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        paths = collect_pokemon_species_batch(
+            [3, 1, 3, 2],
+            client=client,
+            directory=tmp_path,
+        )
+
+    assert paths == [
+        tmp_path / "0003.json",
+        tmp_path / "0001.json",
+        tmp_path / "0002.json",
+    ]
+    assert requested_ids == [3, 1, 2]
+
+
+def test_fetch_pokemon_species_ids_follows_pagination() -> None:
+    requested_offsets: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v2/pokemon-species/"
+        offset = request.url.params.get("offset")
+        assert offset is not None
+        requested_offsets.append(offset)
+
+        if offset == "0":
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "count": 3,
+                    "next": ("https://pokeapi.co/api/v2/pokemon-species/?limit=2&offset=2"),
+                    "previous": None,
+                    "results": [
+                        {
+                            "name": "bulbasaur",
+                            "url": ("https://pokeapi.co/api/v2/pokemon-species/1/"),
+                        },
+                        {
+                            "name": "ivysaur",
+                            "url": ("https://pokeapi.co/api/v2/pokemon-species/2/"),
+                        },
+                    ],
+                },
+            )
+
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "count": 3,
+                "next": None,
+                "previous": ("https://pokeapi.co/api/v2/pokemon-species/?limit=2&offset=0"),
+                "results": [
+                    {
+                        "name": "pikachu",
+                        "url": "https://pokeapi.co/api/v2/pokemon-species/25/",
+                    }
+                ],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        species_ids = fetch_pokemon_species_ids(client=client, page_size=2)
+
+    assert species_ids == [1, 2, 25]
+    assert requested_offsets == ["0", "2"]
+
+
+def test_fetch_pokemon_species_ids_rejects_wrong_resource_endpoint() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "count": 1,
+                "next": None,
+                "previous": None,
+                "results": [
+                    {"url": "https://pokeapi.co/api/v2/pokemon/1/"},
+                ],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(ValueError, match="Unexpected Pokémon species resource URL"):
+            fetch_pokemon_species_ids(client=client)
 
 
 def test_fetch_pokemon_returns_json_payload() -> None:
