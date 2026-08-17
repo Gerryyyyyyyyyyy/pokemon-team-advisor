@@ -5,8 +5,14 @@ werden später separat gesammelt und validiert. Hier verarbeiten wir nur die dar
 entstandenen Beziehungen zwischen Pokémon-Spezies.
 """
 
+import json
 from collections.abc import Iterable
-from typing import TypedDict
+from pathlib import Path
+from typing import TypedDict, cast
+
+import httpx
+
+type JsonObject = dict[str, object]
 
 
 class SpeciesEvolutionData(TypedDict):
@@ -22,10 +28,126 @@ class EvolutionFeatures(TypedDict):
     """Abgeleitete Evolutionsmerkmale für den Processed-Datensatz."""
 
     evolution_chain_id: int
+    evolution_family: str
     evolution_stage: int
     evolution_max_stage: int
     is_final_evolution: bool
     generation: int
+
+
+def _require_object(value: object, *, field: str) -> JsonObject:
+    """Einen Wert als JSON-Objekt validieren."""
+    if not isinstance(value, dict):
+        raise ValueError(f"Field '{field}' must be a JSON object.")
+
+    return cast(JsonObject, value)
+
+
+def _require_string(value: object, *, field: str) -> str:
+    """Einen nicht leeren String validieren."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Field '{field}' must be a non-empty string.")
+
+    return value
+
+
+def _resource_id_from_url(
+    value: object,
+    *,
+    endpoint: str,
+    field: str,
+) -> int:
+    """Eine positive Ressourcen-ID aus einer PokéAPI-URL extrahieren."""
+    resource_url = _require_string(value, field=field)
+    path_parts = httpx.URL(resource_url).path.strip("/").split("/")
+
+    # Der vorletzte Teil identifiziert den erwarteten Endpunkt, der letzte die ID.
+    # So akzeptieren wir nicht versehentlich beispielsweise eine Pokémon-ID als
+    # Evolutionsketten-ID.
+    if len(path_parts) < 2 or path_parts[-2] != endpoint:
+        raise ValueError(f"Field '{field}' has an unexpected resource URL.")
+
+    try:
+        resource_id = int(path_parts[-1])
+    except ValueError as error:
+        raise ValueError(f"Field '{field}' resource URL has no numeric ID.") from error
+
+    if resource_id <= 0:
+        raise ValueError(f"Field '{field}' resource ID must be positive.")
+
+    return resource_id
+
+
+def parse_species_evolution_data(payload: JsonObject) -> SpeciesEvolutionData:
+    """Eine Pokémon-Species-Antwort auf Evolutionsangaben reduzieren.
+
+    PokéAPI liefert deutlich mehr Speziesmerkmale, als wir für die aktuelle
+    Fragestellung benötigen. Diese Funktion validiert und übernimmt nur Name,
+    direkten Vorgänger, Evolutionsketten-ID und Einführungsgeneration.
+    """
+    name = _require_string(payload.get("name"), field="name")
+
+    raw_parent = payload.get("evolves_from_species")
+    if raw_parent is None:
+        evolves_from = None
+    else:
+        parent = _require_object(raw_parent, field="evolves_from_species")
+        evolves_from = _require_string(
+            parent.get("name"),
+            field="evolves_from_species.name",
+        )
+
+    evolution_chain = _require_object(
+        payload.get("evolution_chain"),
+        field="evolution_chain",
+    )
+    evolution_chain_id = _resource_id_from_url(
+        evolution_chain.get("url"),
+        endpoint="evolution-chain",
+        field="evolution_chain.url",
+    )
+
+    generation = _require_object(payload.get("generation"), field="generation")
+    generation_id = _resource_id_from_url(
+        generation.get("url"),
+        endpoint="generation",
+        field="generation.url",
+    )
+
+    return SpeciesEvolutionData(
+        name=name,
+        evolves_from=evolves_from,
+        evolution_chain_id=evolution_chain_id,
+        generation=generation_id,
+    )
+
+
+def load_species_evolution_data(
+    raw_directory: Path,
+) -> list[SpeciesEvolutionData]:
+    """Alle gecachten Species-Antworten eines Verzeichnisses einlesen.
+
+    Die sortierten Dateinamen machen die Verarbeitung reproduzierbar. Inhaltlich
+    verlassen wir uns trotzdem auf die Werte im JSON und nicht auf den Dateinamen.
+    """
+    if not raw_directory.is_dir():
+        raise FileNotFoundError(f"Raw species directory does not exist: {raw_directory}")
+
+    species_records: list[SpeciesEvolutionData] = []
+    for path in sorted(raw_directory.glob("*.json")):
+        raw_payload: object = json.loads(path.read_text(encoding="utf-8"))
+        payload = _require_object(raw_payload, field=str(path))
+        species_records.append(parse_species_evolution_data(payload))
+
+    return species_records
+
+
+def prepare_evolution_directory(
+    raw_directory: Path,
+) -> dict[str, EvolutionFeatures]:
+    """Species-Rohdaten laden und Evolutionsmerkmale je Name berechnen."""
+    species_records = load_species_evolution_data(raw_directory)
+    return build_evolution_features(species_records)
 
 
 def build_evolution_features(
@@ -44,8 +166,8 @@ def build_evolution_features(
         Ein Dictionary, das jeden Speziesnamen auf seine Merkmale abbildet.
 
     Raises:
-        ValueError: Bei doppelten Spezies, fehlenden Vorgängern, widersprüchlichen
-            Ketten-IDs oder einem Zyklus in den Evolutionsbeziehungen.
+        ValueError: Bei doppelten Spezies, fehlenden Vorgängern oder einem Zyklus
+            in den Evolutionsbeziehungen.
     """
     records_by_name: dict[str, SpeciesEvolutionData] = {}
 
@@ -67,23 +189,20 @@ def build_evolution_features(
         if parent_name is None:
             continue
 
-        parent = records_by_name.get(parent_name)
-        if parent is None:
+        if parent_name not in records_by_name:
             raise ValueError(f"Missing evolution parent '{parent_name}' for species '{name}'.")
-
-        if parent["evolution_chain_id"] != record["evolution_chain_id"]:
-            raise ValueError(f"Evolution chain mismatch between '{parent_name}' and '{name}'.")
 
         children_by_name[parent_name].add(name)
 
     stages_by_name: dict[str, int] = {}
+    family_by_name: dict[str, str] = {}
     currently_resolving: set[str] = set()
 
-    def resolve_stage(name: str) -> int:
-        """Die Stufe rekursiv bestimmen und bereits berechnete Werte cachen."""
+    def resolve_stage_and_family(name: str) -> tuple[int, str]:
+        """Stufe und Wurzel rekursiv bestimmen und Ergebnisse cachen."""
         cached_stage = stages_by_name.get(name)
         if cached_stage is not None:
-            return cached_stage
+            return cached_stage, family_by_name[name]
 
         # Treffen wir beim Folgen der Vorgänger erneut auf denselben Namen,
         # enthält die Eingabe einen fachlich unmöglichen Zyklus.
@@ -95,31 +214,36 @@ def build_evolution_features(
 
         if parent_name is None:
             stage = 0
+            family = name
         else:
-            stage = resolve_stage(parent_name) + 1
+            parent_stage, family = resolve_stage_and_family(parent_name)
+            stage = parent_stage + 1
 
         currently_resolving.remove(name)
         stages_by_name[name] = stage
-        return stage
+        family_by_name[name] = family
+        return stage, family
 
     for name in records_by_name:
-        resolve_stage(name)
+        resolve_stage_and_family(name)
 
-    # Alle Mitglieder derselben Kette erhalten dieselbe maximale Kettenstufe.
-    # Bei verzweigten Ketten ist dies die tiefste vorhandene Entwicklung.
-    max_stage_by_chain: dict[int, int] = {}
+    # Die normalisierte Familie folgt den tatsächlichen Vorgängerbeziehungen. Das
+    # ist nötig, weil PokéAPI in Sonderfällen wie Meltan/Melmetal unterschiedliche
+    # evolution_chain-IDs liefert, obwohl evolves_from_species beide verbindet.
+    max_stage_by_family: dict[str, int] = {}
     for name, stage in stages_by_name.items():
-        chain_id = records_by_name[name]["evolution_chain_id"]
-        previous_maximum = max_stage_by_chain.get(chain_id, 0)
-        max_stage_by_chain[chain_id] = max(previous_maximum, stage)
+        family = family_by_name[name]
+        previous_maximum = max_stage_by_family.get(family, 0)
+        max_stage_by_family[family] = max(previous_maximum, stage)
 
     features_by_name: dict[str, EvolutionFeatures] = {}
     for name, record in records_by_name.items():
         chain_id = record["evolution_chain_id"]
         features_by_name[name] = EvolutionFeatures(
             evolution_chain_id=chain_id,
+            evolution_family=family_by_name[name],
             evolution_stage=stages_by_name[name],
-            evolution_max_stage=max_stage_by_chain[chain_id],
+            evolution_max_stage=max_stage_by_family[family_by_name[name]],
             is_final_evolution=not children_by_name[name],
             generation=record["generation"],
         )
