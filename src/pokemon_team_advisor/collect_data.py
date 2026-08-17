@@ -62,6 +62,10 @@ class PokemonNotFoundError(LookupError):
     """
 
 
+class PokemonSpeciesNotFoundError(LookupError):
+    """Fehler für eine Pokémon-Spezies, die die PokéAPI nicht kennt."""
+
+
 def _validate_pokemon_id(value: object) -> int:
     """Eine gültige Pokémon-ID zurückgeben oder einen klaren Fehler auslösen.
 
@@ -295,53 +299,77 @@ def fetch_pokemon(
     return _response_json_object(response)
 
 
-def _pokemon_id_from_resource_url(resource_url: object) -> int:
-    """Eine numerische Pokémon-ID aus einer PokéAPI-Resource-URL lesen.
-
-    Wir verwenden die von der API gelieferten URLs statt ``range(1, max_id)``.
-    Dadurch funktionieren auch Ressourcen mit hohen Form-IDs und mögliche Lücken
-    im ID-Raum, ohne dass wir sie erraten müssen.
-    """
-    if not isinstance(resource_url, str) or not resource_url:
-        raise ValueError("Pokémon resource URL must be a non-empty string.")
-
-    path_parts = httpx.URL(resource_url).path.strip("/").split("/")
-    if len(path_parts) < 2 or path_parts[-2] != "pokemon":
-        raise ValueError(f"Unexpected Pokémon resource URL: {resource_url}")
-
-    try:
-        pokemon_id = int(path_parts[-1])
-    except ValueError as error:
-        raise ValueError(f"Pokémon resource URL has no numeric ID: {resource_url}") from error
-
-    return _validate_pokemon_id(pokemon_id)
-
-
-def fetch_pokemon_ids(
+def fetch_pokemon_species(
+    identifier: int | str,
     *,
     client: httpx.Client,
-    page_size: int = DEFAULT_RESOURCE_PAGE_SIZE,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
     sleep: Sleeper = time.sleep,
-) -> list[int]:
-    """Alle aktuell gelisteten Pokémon-Resource-IDs paginiert ermitteln.
+) -> JsonObject:
+    """Eine Pokémon-Spezies mit derselben Retry-Strategie abrufen.
 
-    Die PokéAPI liefert neben Standard-Pokémon auch alternative Formen als eigene
-    Pokémon-Ressourcen. Wir sammeln zunächst alle von der API gemeldeten IDs. Der
-    bereits getestete ``is_default``-Filter in ``prepare_data.py`` entscheidet erst
-    später, welche davon in den MVP-Datensatz gelangen.
-
-    Die Funktion folgt dem ``next``-Link der API, prüft eine konstante Gesamtzahl
-    über alle Seiten und erkennt doppelte IDs oder zyklische Pagination als
-    Datenfehler. Damit wird eine unvollständige Liste nicht still akzeptiert.
+    Der Species-Endpunkt enthält unter anderem den direkten Evolutionsvorgänger,
+    die Evolutionsketten-Referenz und die Einführungsgeneration. Die vollständige
+    Antwort wird unverändert zurückgegeben und erst später aufbereitet.
     """
+    url = f"{POKEAPI_BASE_URL}/pokemon-species/{identifier}/"
+    response = _get_with_retries(
+        url,
+        client=client,
+        max_attempts=max_attempts,
+        retry_delay_seconds=retry_delay_seconds,
+        sleep=sleep,
+    )
+
+    if response.status_code == httpx.codes.NOT_FOUND:
+        raise PokemonSpeciesNotFoundError(f"Pokémon species '{identifier}' was not found.")
+
+    response.raise_for_status()
+    return _response_json_object(response)
+
+
+def _resource_id_from_url(
+    resource_url: object,
+    *,
+    endpoint: str,
+    resource_label: str,
+) -> int:
+    """Eine numerische ID aus einer PokéAPI-Resource-URL lesen."""
+    if not isinstance(resource_url, str) or not resource_url:
+        raise ValueError(f"{resource_label} resource URL must be a non-empty string.")
+
+    path_parts = httpx.URL(resource_url).path.strip("/").split("/")
+    if len(path_parts) < 2 or path_parts[-2] != endpoint:
+        raise ValueError(f"Unexpected {resource_label} resource URL: {resource_url}")
+
+    try:
+        resource_id = int(path_parts[-1])
+    except ValueError as error:
+        raise ValueError(
+            f"{resource_label} resource URL has no numeric ID: {resource_url}"
+        ) from error
+
+    return _validate_pokemon_id(resource_id)
+
+
+def _fetch_resource_ids(
+    *,
+    endpoint: str,
+    resource_label: str,
+    client: httpx.Client,
+    page_size: int,
+    max_attempts: int,
+    retry_delay_seconds: float,
+    sleep: Sleeper,
+) -> list[int]:
+    """IDs eines benannten PokéAPI-Endpunkts vollständig paginiert ermitteln."""
     if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0:
         raise ValueError("page_size must be a positive integer.")
 
-    next_url: str | None = f"{POKEAPI_BASE_URL}/pokemon/?limit={page_size}&offset=0"
+    next_url: str | None = f"{POKEAPI_BASE_URL}/{endpoint}/?limit={page_size}&offset=0"
     expected_count: int | None = None
-    pokemon_ids: list[int] = []
+    resource_ids: list[int] = []
     seen_ids: set[int] = set()
     visited_pages: set[str] = set()
 
@@ -376,27 +404,79 @@ def fetch_pokemon_ids(
             if not isinstance(raw_resource, dict):
                 raise ValueError(f"PokéAPI resource results[{index}] must be a JSON object.")
 
-            pokemon_id = _pokemon_id_from_resource_url(raw_resource.get("url"))
-            if pokemon_id in seen_ids:
-                raise ValueError(f"Duplicate Pokémon resource ID: {pokemon_id}.")
+            resource_id = _resource_id_from_url(
+                raw_resource.get("url"),
+                endpoint=endpoint,
+                resource_label=resource_label,
+            )
+            if resource_id in seen_ids:
+                raise ValueError(f"Duplicate {resource_label} resource ID: {resource_id}.")
 
-            seen_ids.add(pokemon_id)
-            pokemon_ids.append(pokemon_id)
+            seen_ids.add(resource_id)
+            resource_ids.append(resource_id)
 
         raw_next = payload.get("next")
         if raw_next is not None and not isinstance(raw_next, str):
             raise ValueError("PokéAPI resource next link must be a string or null.")
         next_url = raw_next
 
-    # Ein ``next = null`` allein beweist nicht, dass alle Ressourcen angekommen
-    # sind. Der Abgleich mit ``count`` erkennt auch eine zu früh beendete Liste.
-    if expected_count is None or len(pokemon_ids) != expected_count:
+    if expected_count is None or len(resource_ids) != expected_count:
         raise ValueError(
             "PokéAPI resource list is incomplete: "
-            f"expected {expected_count}, received {len(pokemon_ids)}."
+            f"expected {expected_count}, received {len(resource_ids)}."
         )
 
-    return pokemon_ids
+    return resource_ids
+
+
+def fetch_pokemon_ids(
+    *,
+    client: httpx.Client,
+    page_size: int = DEFAULT_RESOURCE_PAGE_SIZE,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
+    sleep: Sleeper = time.sleep,
+) -> list[int]:
+    """Alle aktuell gelisteten Pokémon-Resource-IDs paginiert ermitteln.
+
+    Die PokéAPI liefert neben Standard-Pokémon auch alternative Formen als eigene
+    Pokémon-Ressourcen. Wir sammeln zunächst alle von der API gemeldeten IDs. Der
+    bereits getestete ``is_default``-Filter in ``prepare_data.py`` entscheidet erst
+    später, welche davon in den MVP-Datensatz gelangen.
+
+    Die Funktion folgt dem ``next``-Link der API, prüft eine konstante Gesamtzahl
+    über alle Seiten und erkennt doppelte IDs oder zyklische Pagination als
+    Datenfehler. Damit wird eine unvollständige Liste nicht still akzeptiert.
+    """
+    return _fetch_resource_ids(
+        endpoint="pokemon",
+        resource_label="Pokémon",
+        client=client,
+        page_size=page_size,
+        max_attempts=max_attempts,
+        retry_delay_seconds=retry_delay_seconds,
+        sleep=sleep,
+    )
+
+
+def fetch_pokemon_species_ids(
+    *,
+    client: httpx.Client,
+    page_size: int = DEFAULT_RESOURCE_PAGE_SIZE,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
+    sleep: Sleeper = time.sleep,
+) -> list[int]:
+    """Alle aktuell gelisteten Pokémon-Species-IDs paginiert ermitteln."""
+    return _fetch_resource_ids(
+        endpoint="pokemon-species",
+        resource_label="Pokémon species",
+        client=client,
+        page_size=page_size,
+        max_attempts=max_attempts,
+        retry_delay_seconds=retry_delay_seconds,
+        sleep=sleep,
+    )
 
 
 def cache_pokemon_response(
@@ -449,6 +529,20 @@ def cache_pokemon_response(
     return output_path
 
 
+def cache_pokemon_species_response(
+    payload: JsonObject,
+    *,
+    directory: Path,
+) -> Path:
+    """Eine vollständige Species-Antwort im eigenen Raw-Verzeichnis cachen.
+
+    Pokémon- und Species-Antworten besitzen beide eine positive numerische ``id``.
+    Deshalb verwenden sie dasselbe deterministische und atomare Dateiformat.
+    Getrennte Zielverzeichnisse verhindern Namenskonflikte zwischen den Ressourcen.
+    """
+    return cache_pokemon_response(payload, directory=directory)
+
+
 def collect_pokemon(
     pokemon_id: int,
     *,
@@ -480,6 +574,23 @@ def collect_pokemon(
     # jeweiligen Funktionen gekapselt. Das erleichtert Tests und spätere Änderungen.
     payload = fetch_pokemon(validated_id, client=client)
     return cache_pokemon_response(payload, directory=directory)
+
+
+def collect_pokemon_species(
+    species_id: int,
+    *,
+    client: httpx.Client,
+    directory: Path,
+) -> Path:
+    """Vorhandene Species-Rohdaten verwenden oder abrufen und speichern."""
+    validated_id = _validate_pokemon_id(species_id)
+    cached_path = _cache_path(validated_id, directory=directory)
+
+    if cached_path.is_file():
+        return cached_path
+
+    payload = fetch_pokemon_species(validated_id, client=client)
+    return cache_pokemon_species_response(payload, directory=directory)
 
 
 def collect_pokemon_batch(
@@ -519,6 +630,27 @@ def collect_pokemon_batch(
     for pokemon_id in validated_ids:
         path = collect_pokemon(
             pokemon_id,
+            client=client,
+            directory=directory,
+        )
+        collected_paths.append(path)
+
+    return collected_paths
+
+
+def collect_pokemon_species_batch(
+    species_ids: Iterable[int],
+    *,
+    client: httpx.Client,
+    directory: Path,
+) -> list[Path]:
+    """Mehrere Species-Ressourcen sequenziell und wiederaufnehmbar sammeln."""
+    validated_ids = _validate_unique_pokemon_ids(species_ids)
+
+    collected_paths: list[Path] = []
+    for species_id in validated_ids:
+        path = collect_pokemon_species(
+            species_id,
             client=client,
             directory=directory,
         )
