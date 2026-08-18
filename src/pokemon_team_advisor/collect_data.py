@@ -66,6 +66,10 @@ class PokemonSpeciesNotFoundError(LookupError):
     """Fehler für eine Pokémon-Spezies, die die PokéAPI nicht kennt."""
 
 
+class PokemonTypeNotFoundError(LookupError):
+    """Fehler für einen Pokémon-Typ, den die PokéAPI nicht kennt."""
+
+
 def _validate_pokemon_id(value: object) -> int:
     """Eine gültige Pokémon-ID zurückgeben oder einen klaren Fehler auslösen.
 
@@ -96,6 +100,42 @@ def _cache_path(pokemon_id: int, *, directory: Path) -> Path:
     ``0001.json``, ``0002.json``, ..., ``0150.json``.
     """
     return directory / f"{pokemon_id:04d}.json"
+
+
+def _validate_type_name(value: object) -> str:
+    """Einen sicheren, normalisierten PokéAPI-Typnamen validieren.
+
+    Die strikte Zeichenprüfung verhindert insbesondere, dass ein ungeprüfter Name
+    wie ``../secret`` den vorgesehenen Cache-Ordner verlassen könnte.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError("Pokémon type name must be a non-empty string.")
+
+    if not value.isascii() or any(
+        not (character.islower() or character.isdigit() or character == "-") for character in value
+    ):
+        raise ValueError("Pokémon type name must use lowercase ASCII letters, digits, or hyphens.")
+
+    return value
+
+
+def _type_cache_path(type_name: str, *, directory: Path) -> Path:
+    """Den lesbaren Cache-Pfad für eine Type-Ressource erzeugen."""
+    return directory / f"{type_name}.json"
+
+
+def _validate_unique_type_names(type_names: Iterable[str]) -> list[str]:
+    """Typnamen vollständig prüfen und Duplikate geordnet entfernen."""
+    validated_names: list[str] = []
+    seen_names: set[str] = set()
+
+    for type_name in type_names:
+        validated_name = _validate_type_name(type_name)
+        if validated_name not in seen_names:
+            seen_names.add(validated_name)
+            validated_names.append(validated_name)
+
+    return validated_names
 
 
 def _validate_retry_settings(
@@ -329,6 +369,37 @@ def fetch_pokemon_species(
     return _response_json_object(response)
 
 
+def fetch_type(
+    type_name: str,
+    *,
+    client: httpx.Client,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
+    sleep: Sleeper = time.sleep,
+) -> JsonObject:
+    """Eine vollständige Type-Ressource mit der zentralen Retry-Strategie abrufen.
+
+    Die Antwort wird absichtlich nicht auf ``damage_relations`` reduziert. Dadurch
+    bleiben auch ``past_damage_relations`` für eine spätere generationenspezifische
+    Erweiterung im Raw-Cache erhalten.
+    """
+    validated_name = _validate_type_name(type_name)
+    url = f"{POKEAPI_BASE_URL}/type/{validated_name}/"
+    response = _get_with_retries(
+        url,
+        client=client,
+        max_attempts=max_attempts,
+        retry_delay_seconds=retry_delay_seconds,
+        sleep=sleep,
+    )
+
+    if response.status_code == httpx.codes.NOT_FOUND:
+        raise PokemonTypeNotFoundError(f"Pokémon type '{validated_name}' was not found.")
+
+    response.raise_for_status()
+    return _response_json_object(response)
+
+
 def _resource_id_from_url(
     resource_url: object,
     *,
@@ -479,31 +550,14 @@ def fetch_pokemon_species_ids(
     )
 
 
-def cache_pokemon_response(
-    payload: JsonObject,
-    *,
-    directory: Path,
-) -> Path:
-    """Eine PokéAPI-Antwort deterministisch und atomar als JSON speichern.
+def _write_json_atomically(payload: JsonObject, *, output_path: Path) -> Path:
+    """Ein JSON-Objekt deterministisch und atomar in den Raw-Cache schreiben.
 
-    Args:
-        payload: Vollständiges JSON-Objekt eines Pokémon.
-        directory: Zielverzeichnis, beispielsweise ``data/raw/pokemon``.
-
-    Returns:
-        Pfad der fertig geschriebenen Cache-Datei.
-
-    Raises:
-        ValueError: Wenn ``payload`` keine gültige positive Pokémon-ID enthält.
-        TypeError: Wenn das Payload nicht als JSON serialisiert werden kann.
-        OSError: Wenn Verzeichnis oder Datei nicht geschrieben werden können.
+    Diese technische Logik gilt gleichermaßen für Pokémon-, Species- und
+    Type-Ressourcen. Die öffentlichen Cache-Funktionen bestimmen zuvor nur den
+    jeweils passenden Dateinamen.
     """
-    pokemon_id = _validate_pokemon_id(payload.get("id"))
-
-    # ``parents=True`` erstellt auch fehlende übergeordnete Ordner. ``exist_ok=True``
-    # macht wiederholte Aufrufe sicher, wenn das Verzeichnis schon vorhanden ist.
-    directory.mkdir(parents=True, exist_ok=True)
-    output_path = _cache_path(pokemon_id, directory=directory)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Wir schreiben zuerst in eine temporäre Datei. So ersetzt ein Prozessabbruch
     # während des Schreibens keine eventuell vorhandene, vollständige Cache-Datei.
@@ -529,6 +583,31 @@ def cache_pokemon_response(
     return output_path
 
 
+def cache_pokemon_response(
+    payload: JsonObject,
+    *,
+    directory: Path,
+) -> Path:
+    """Eine PokéAPI-Antwort deterministisch und atomar als JSON speichern.
+
+    Args:
+        payload: Vollständiges JSON-Objekt eines Pokémon.
+        directory: Zielverzeichnis, beispielsweise ``data/raw/pokemon``.
+
+    Returns:
+        Pfad der fertig geschriebenen Cache-Datei.
+
+    Raises:
+        ValueError: Wenn ``payload`` keine gültige positive Pokémon-ID enthält.
+        TypeError: Wenn das Payload nicht als JSON serialisiert werden kann.
+        OSError: Wenn Verzeichnis oder Datei nicht geschrieben werden können.
+    """
+    pokemon_id = _validate_pokemon_id(payload.get("id"))
+
+    output_path = _cache_path(pokemon_id, directory=directory)
+    return _write_json_atomically(payload, output_path=output_path)
+
+
 def cache_pokemon_species_response(
     payload: JsonObject,
     *,
@@ -541,6 +620,22 @@ def cache_pokemon_species_response(
     Getrennte Zielverzeichnisse verhindern Namenskonflikte zwischen den Ressourcen.
     """
     return cache_pokemon_response(payload, directory=directory)
+
+
+def cache_type_response(
+    payload: JsonObject,
+    *,
+    directory: Path,
+) -> Path:
+    """Eine vollständige Type-Antwort unter ihrem lesbaren Namen cachen.
+
+    Anders als Pokémon-Dateien werden Typen nicht über eine numerische ID, sondern
+    beispielsweise als ``fire.json`` gespeichert. Das erleichtert die Kontrolle
+    der kleinen Menge von 18 regulären Typen.
+    """
+    type_name = _validate_type_name(payload.get("name"))
+    output_path = _type_cache_path(type_name, directory=directory)
+    return _write_json_atomically(payload, output_path=output_path)
 
 
 def collect_pokemon(
@@ -591,6 +686,30 @@ def collect_pokemon_species(
 
     payload = fetch_pokemon_species(validated_id, client=client)
     return cache_pokemon_species_response(payload, directory=directory)
+
+
+def collect_type(
+    type_name: str,
+    *,
+    client: httpx.Client,
+    directory: Path,
+) -> Path:
+    """Vorhandene Type-Rohdaten verwenden oder vollständig abrufen und cachen."""
+    validated_name = _validate_type_name(type_name)
+    cached_path = _type_cache_path(validated_name, directory=directory)
+
+    if cached_path.is_file():
+        return cached_path
+
+    payload = fetch_type(validated_name, client=client)
+    response_name = _validate_type_name(payload.get("name"))
+    if response_name != validated_name:
+        raise ValueError(
+            "PokéAPI type response name does not match request: "
+            f"expected '{validated_name}', received '{response_name}'."
+        )
+
+    return cache_type_response(payload, directory=directory)
 
 
 def collect_pokemon_batch(
@@ -651,6 +770,27 @@ def collect_pokemon_species_batch(
     for species_id in validated_ids:
         path = collect_pokemon_species(
             species_id,
+            client=client,
+            directory=directory,
+        )
+        collected_paths.append(path)
+
+    return collected_paths
+
+
+def collect_type_batch(
+    type_names: Iterable[str],
+    *,
+    client: httpx.Client,
+    directory: Path,
+) -> list[Path]:
+    """Mehrere Type-Ressourcen geordnet, eindeutig und wiederaufnehmbar sammeln."""
+    validated_names = _validate_unique_type_names(type_names)
+
+    collected_paths: list[Path] = []
+    for type_name in validated_names:
+        path = collect_type(
+            type_name,
             client=client,
             directory=directory,
         )

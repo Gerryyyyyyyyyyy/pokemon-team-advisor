@@ -9,18 +9,180 @@ import pytest
 from pokemon_team_advisor.collect_data import (
     PokemonNotFoundError,
     PokemonSpeciesNotFoundError,
+    PokemonTypeNotFoundError,
     cache_pokemon_response,
     cache_pokemon_species_response,
+    cache_type_response,
     collect_pokemon,
     collect_pokemon_batch,
     collect_pokemon_species,
     collect_pokemon_species_batch,
+    collect_type,
+    collect_type_batch,
     create_http_client,
     fetch_pokemon,
     fetch_pokemon_ids,
     fetch_pokemon_species,
     fetch_pokemon_species_ids,
+    fetch_type,
 )
+
+
+def _type_payload(name: str = "fire") -> dict[str, object]:
+    """Eine kleine vollständige Type-Antwort für Collector-Tests erzeugen."""
+    return {
+        "id": 10,
+        "name": name,
+        "damage_relations": {
+            "double_damage_to": [{"name": "grass"}],
+            "half_damage_to": [{"name": "water"}],
+            "no_damage_to": [],
+        },
+        "past_damage_relations": [
+            {
+                "generation": {"name": "generation-i"},
+                "damage_relations": {},
+            }
+        ],
+    }
+
+
+def test_fetch_type_returns_complete_json_payload() -> None:
+    """Aktuelle und historische Beziehungen unverändert zurückgeben."""
+    expected = _type_payload()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://pokeapi.co/api/v2/type/fire/"
+        return httpx.Response(200, request=request, json=expected)
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        result = fetch_type("fire", client=client)
+
+    assert result == expected
+    assert result["past_damage_relations"] == expected["past_damage_relations"]
+
+
+def test_fetch_type_raises_clear_error_for_missing_type() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(404, request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(PokemonTypeNotFoundError, match="missing-type"):
+            fetch_type("missing-type", client=client)
+
+    assert len(requests) == 1
+
+
+def test_fetch_type_reuses_retry_strategy() -> None:
+    status_codes = iter([503, 200])
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            next(status_codes),
+            request=request,
+            json=_type_payload(),
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        result = fetch_type("fire", client=client, sleep=delays.append)
+
+    assert result["name"] == "fire"
+    assert delays == [0.5]
+
+
+def test_cache_type_response_writes_named_complete_json(tmp_path: Path) -> None:
+    payload = _type_payload()
+    directory = tmp_path / "types"
+
+    output_path = cache_type_response(payload, directory=directory)
+
+    assert output_path == directory / "fire.json"
+    assert json.loads(output_path.read_text(encoding="utf-8")) == payload
+    assert output_path.read_text(encoding="utf-8").endswith("\n")
+    assert not output_path.with_suffix(".json.tmp").exists()
+
+
+@pytest.mark.parametrize("invalid_name", [None, "", "Fire", "../fire", "fire/water"])
+def test_cache_type_response_rejects_invalid_name(
+    tmp_path: Path,
+    invalid_name: object,
+) -> None:
+    payload: dict[str, object] = {"name": invalid_name}
+
+    with pytest.raises(ValueError, match="type name"):
+        cache_type_response(payload, directory=tmp_path)
+
+
+def test_collect_type_uses_existing_cache(tmp_path: Path) -> None:
+    cached_path = cache_type_response(_type_payload(), directory=tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"Unexpected API request: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        result = collect_type("fire", client=client, directory=tmp_path)
+
+    assert result == cached_path
+
+
+def test_collect_type_rejects_mismatched_response_name(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json=_type_payload("water"),
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(ValueError, match="does not match request"):
+            collect_type("fire", client=client, directory=tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_collect_type_batch_preserves_order_and_removes_duplicates(
+    tmp_path: Path,
+) -> None:
+    requested_names: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        type_name = request.url.path.rstrip("/").split("/")[-1]
+        requested_names.append(type_name)
+        return httpx.Response(
+            200,
+            request=request,
+            json=_type_payload(type_name),
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        paths = collect_type_batch(
+            ["water", "fire", "water", "grass"],
+            client=client,
+            directory=tmp_path,
+        )
+
+    assert paths == [
+        tmp_path / "water.json",
+        tmp_path / "fire.json",
+        tmp_path / "grass.json",
+    ]
+    assert requested_names == ["water", "fire", "grass"]
 
 
 def test_fetch_pokemon_species_returns_json_payload() -> None:
