@@ -851,7 +851,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4.0" },
     { name = "python-dotenv", specifier = ">=1.0,<2.0" },
     { name = "scikit-learn", specifier = ">=1.5,<2.0" },
-    { name = "streamlit", specifier = ">=1.39,<2.0" },
+    { name = "streamlit", specifier = ">=1.59,<2.0" },
 ]
 
 [package.metadata.requires-dev]
