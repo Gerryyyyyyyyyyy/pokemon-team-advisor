@@ -1,19 +1,19 @@
 # Pokémon Team Advisor
 
-Der Pokémon Team Advisor analysiert die defensive Typenabdeckung eines Pokémon-Teams.
-Die Anwendung verbindet eine reproduzierbare PokéAPI-Datenpipeline, explorative
-Analyse, PostgreSQL und eine interaktive Streamlit-Oberfläche. Im nächsten
-Entwicklungsschritt werden Rollenmerkmale und anschließend nachvollziehbare
-Empfehlungen für einen weiteren Teamplatz ergänzt.
+Der Pokémon Team Advisor analysiert die defensive Typenabdeckung und die Werteprofile
+eines Pokémon-Teams. Die Anwendung verbindet eine reproduzierbare PokéAPI-Datenpipeline,
+explorative Analyse, PostgreSQL, ein transparentes Multi-Label-Rollenmodell und eine
+interaktive Streamlit-Oberfläche. Im nächsten Entwicklungsschritt werden daraus
+nachvollziehbare Empfehlungen für einen weiteren Teamplatz abgeleitet.
 
 ## Projektstatus
 
-**Die Projektgrundlage, Datensammlung, EDA mit SQL sowie das Typensystem sind
-abgeschlossen.** Die Pokémon-Ressourcen werden dynamisch über PokéAPI ermittelt, mit
-Timeouts und Retries abgerufen, lokal als unveränderte Rohdaten gecacht und
-anschließend in einen analysierbaren Datensatz überführt. Die Streamlit-App enthält
-bereits Teamwahl, Live-Suche, Filter und defensive Typenanalyse; Rollenmodell und
-Kandidatenranking folgen in den nächsten Phasen.
+**Die Projektgrundlage, Datensammlung, EDA mit SQL, das Typensystem und das
+Rollenmodell sind abgeschlossen.** Die Pokémon-Ressourcen werden dynamisch über
+PokéAPI ermittelt, mit Timeouts und Retries abgerufen, lokal als unveränderte Rohdaten
+gecacht und anschließend in einen analysierbaren Datensatz überführt. Die
+Streamlit-App enthält bereits Teamwahl, Live-Suche, Filter und defensive
+Typenanalyse. Als nächste Kernfunktion folgt das erklärbare Kandidatenranking.
 
 Stand des Datensatz-Snapshots vom **08.08.2026**:
 
@@ -27,6 +27,10 @@ Stand des Datensatz-Snapshots vom **08.08.2026**:
   geladen und dort erneut auf Eindeutigkeit und Konsistenz geprüft.
 - Das Datenbankschema besitzt fachliche Constraints, Row Level Security und keine
   öffentlichen Zugriffsrichtlinien.
+- Sechs regelbasierte Rollen trennen relative Profilpassung und absolute Stärke und
+  erlauben bis zu drei Labels pro Pokémon.
+- Ein stabiler K-Means-Vergleich bestätigt vier grobe Wertearchetypen, ersetzt die
+  transparenten Multi-Label-Regeln aber bewusst nicht.
 
 Die Zahlen beschreiben diesen Snapshot und sind nicht als dauerhaft feste Anzahl von
 PokéAPI-Ressourcen zu verstehen.
@@ -125,7 +129,7 @@ Streamlit zeigt anschließend die lokale URL im Terminal. Die Oberfläche bietet
 Live-Suche nach Name oder Pokédex-ID, Filter nach Typ, Generation, Entwicklungsstufe
 und Basiswerten, eine Kartenansicht zur Teamwahl und die defensive Analyse gemeinsamer
 Schwächen. Die Loadout-Ansicht ist als klar gekennzeichnete Vorschau vorhanden;
-Empfehlungen werden erst nach Rollen- und Scoringmodell aktiviert.
+Empfehlungen werden mit dem Scoringmodell der nächsten Phase aktiviert.
 
 ## Qualitätsprüfungen
 
@@ -161,6 +165,8 @@ pokemon-team-advisor/
 │   ├── processed/
 │   └── raw/
 ├── notebooks/
+│   ├── 01_pokemon_eda.ipynb
+│   └── 02_role_analysis.ipynb
 ├── reports/figures/
 ├── sql/
 │   ├── analyses/
@@ -174,6 +180,7 @@ pokemon-team-advisor/
 │   ├── evolution.py
 │   ├── live_search.py
 │   ├── prepare_data.py
+│   ├── roles.py
 │   ├── team_analysis.py
 │   └── type_effectiveness.py
 ├── tests/unit/
@@ -182,20 +189,20 @@ pokemon-team-advisor/
 └── uv.lock
 ```
 
-Zukünftige Rollen- und Recommender-Module werden erst angelegt, wenn ihr fachlicher
-Vertrag durch Tests beschrieben wird. Leere Architektur-Platzhalter würden die
-Navigation erschweren, ohne bereits einen Nutzen zu bieten.
+Das Rollenmodul wurde erst nach einem fachlichen Testvertrag angelegt. Für den
+Recommender gilt dieselbe Regel: Neue Module entstehen erst zusammen mit überprüfbarem
+Verhalten statt als leere Architektur-Platzhalter.
 
 ## Datenpipeline
 
 ```text
 PokéAPI → Raw-Data-Cache → Filterung/Aufbereitung → data/processed/pokemon.csv
-        → EDA und Supabase PostgreSQL → Typen- und Teamanalyse → Streamlit
-        → Rollenmodell und Recommender (nächste Phasen)
+        → EDA und Supabase PostgreSQL → Typen- und Teamanalyse → Rollenmodell
+        → Streamlit → Recommender (nächste Phase)
 ```
 
-Die Pipeline ist bis zur SQL- und defensiven Teamanalyse implementiert. Die Sammlung
-ist wiederaufnehmbar: Bereits gecachte Ressourcen müssen bei einem erneuten Lauf nicht
+Die Pipeline ist bis zum Rollenmodell implementiert. Die Sammlung ist
+wiederaufnehmbar: Bereits gecachte Ressourcen müssen bei einem erneuten Lauf nicht
 noch einmal von PokéAPI geladen werden. Der PostgreSQL-Import ist ebenfalls
 idempotent; ein identischer zweiter Lauf verändert weder Zeilenanzahl noch
 Ladezeitstempel.
@@ -251,6 +258,45 @@ mit folgendem Befehl übertragen:
 uv run python -m pokemon_team_advisor.database_loader
 ```
 
+## Rollenmodell und Clustering
+
+`roles.py` bildet eine transparente Multi-Label-Baseline mit sechs Rollen:
+physischer Angreifer, spezieller Angreifer, schneller Angreifer, physische Defensive,
+spezielle Defensive und Allrounder. Ein Pokémon kann bis zu drei Rollen erhalten.
+Jedes Pokémon behält mindestens ein Primärprofil; dieses Label ist eine Beschreibung
+und keine Aussage, dass das Pokémon die Rolle wettbewerbsfähig erfüllt.
+
+Für jede Rolle werden zwei Werte getrennt ausgewiesen:
+
+- `fit_score` bewertet die relative Verteilung der sechs Basiswerte.
+- `strength_score` bewertet die relevanten absoluten Werte als empirisches Perzentil
+  innerhalb des Snapshots.
+
+Defensive Rollen verwenden einen geometrischen Bulk-Proxy, damit sehr hohe KP einen
+extrem niedrigen Defensivwert nicht vollständig kompensieren. Ein schneller Angreifer
+benötigt tatsächliche Initiative; ein hoher Angriff allein reicht nicht. Die Tests
+halten unter anderem Blissey, Shedinja, Pikachu, Shuckle und Garchomp als fachliche
+Regressionen fest.
+
+Im aktuellen Snapshot ergeben sich 1.278 Rollenzuweisungen: 791 Pokémon besitzen ein
+Label, 215 besitzen zwei und 19 besitzen drei. Häufigkeiten sind dabei keine
+Qualitätsziele und müssen sich wegen des Multi-Label-Ansatzes nicht zu 100 Prozent
+summieren.
+
+Das Notebook `notebooks/02_role_analysis.ipynb` vergleicht die Regeln mit K-Means auf
+relativen, standardisierten Werteanteilen. Fünf Seeds und Clusterzahlen von zwei bis
+zehn werden mit Silhouette, Davies-Bouldin und paarweisem Adjusted Rand Index geprüft.
+`k = 4` liefert den besten Kompromiss aus Trennung, Stabilität und Clustergröße
+(`Silhouette = 0,200`, `ARI = 0,988`). Die vier Cluster entsprechen grob
+physisch-schnellen, physisch-defensiven, speziell-offensiven und
+KP-/spezialdefensiven Profilen.
+
+Die niedrige absolute Silhouette und deutliche Rollenüberlappungen zeigen jedoch keine
+scharf getrennten natürlichen Klassen. K-Means erzwingt außerdem ein einzelnes Label
+und verliert damit plausible Mehrfachrollen. Das Clustering bleibt deshalb eine
+explorative Validierung und wird nicht als zusätzliches Produktionssignal in den
+Recommender übernommen.
+
 ## Datensatz und zeitlicher Scope
 
 Der aktuelle MVP ist ein **Snapshot des gegenwärtigen PokéAPI-Datenstands** und keine
@@ -287,7 +333,8 @@ Ausgangsdaten verfeinert werden.
 3. **EDA und SQL (abgeschlossen)** – Datenqualität, Visualisierungen,
    Supabase-PostgreSQL-Analysen
 4. **Typensystem (abgeschlossen)** – Matrix, Dual-Types, Team-Schwächen, Tests
-5. **Rollen** – Regeln, skalierte Werte, interpretierter Clustering-Vergleich
+5. **Rollen (abgeschlossen)** – Regeln, skalierte Werte, interpretierter
+   Clustering-Vergleich
 6. **Recommender** – erklärbare Scores, Evaluation, Sensitivitätsanalyse
 7. **Streamlit-App (teilweise umgesetzt)** – Teamwahl und Analyse vorhanden,
    Top-5-Ergebnisse folgen mit dem Recommender
@@ -297,7 +344,9 @@ Ausgangsdaten verfeinert werden.
 
 - Score-Gewichte sind Hypothesen und keine objektiv optimalen Parameter.
 - Ohne Zielvariable wird keine künstliche Accuracy berichtet.
-- Clustering wird nur bei interpretierbarem Erkenntnisgewinn verwendet.
+- Rollenpassung und absolute Rollenstärke bleiben getrennte Größen.
+- Clustering wird nur bei interpretierbarem Erkenntnisgewinn als Produktionssignal
+  verwendet; der aktuelle Vergleich dient ausschließlich der Validierung.
 - Simulierte Experimentdaten werden nie als reale Nutzerbeobachtungen dargestellt.
 - Offensive Coverage wird erst mit echten, versionsbezogenen Attackendaten bewertet.
 - Reinforcement Learning wird nur erwogen, falls später eine vollständige
@@ -305,9 +354,8 @@ Ausgangsdaten verfeinert werden.
 
 ## Nächster Schritt
 
-Phase 5 beginnt mit einem transparenten Rollenmodell. Dafür werden skalierte
-Basiswerte und fachliche Regeln als erklärbare Baseline definiert. Ein ergänzender
-Clustering-Vergleich wird nur übernommen, wenn die Gruppen stabil sind und gegenüber
-den Regeln einen interpretierbaren Mehrwert liefern. Erst danach kombiniert der
-Recommender defensive Abdeckung, offensive Coverage und Rollenpassung zu getrennt
-ausgewiesenen Teilwerten.
+Phase 6 kombiniert defensive Ergänzung, Rollenlücken, Rollenpassung und absolute
+Kandidatenstärke zu getrennt ausgewiesenen Teilwerten. Das Top-5-Ranking wird mit
+fachlichen Fallbeispielen, Sensitivitätsanalysen und Rangstabilität geprüft. Offensive
+Coverage wird erst nach Integration echter, versionsbezogener Attackendaten ergänzt
+und nicht aus den Pokémon-Typen abgeleitet.
