@@ -6,7 +6,12 @@ import pytest
 import streamlit as st
 
 import pokemon_team_advisor.live_search as live_search_module
-from pokemon_team_advisor.live_search import _limited_text, live_search_input
+from pokemon_team_advisor.live_search import (
+    _DEBOUNCE_MS,
+    _LIVE_SEARCH_JS,
+    _limited_text,
+    live_search_input,
+)
 
 
 def test_limited_text_keeps_strings_within_limit() -> None:
@@ -31,10 +36,10 @@ def test_live_search_rejects_invalid_configuration() -> None:
         )
 
 
-def test_live_search_prefers_current_change_event(
+def test_live_search_uses_persistent_component_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Ein neuer Tastendruck muss einen älteren Session-Wert sofort ersetzen."""
+    """Der gespeicherte Komponentenwert ist die einzige Textquelle."""
     monkeypatch.setitem(
         st.session_state,
         "live-search-test",
@@ -42,7 +47,7 @@ def test_live_search_prefers_current_change_event(
     )
 
     def component_result(**_kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(value="alter wert", changed="ivysaur")
+        return SimpleNamespace(value="ivysaur", changed="alter wert")
 
     monkeypatch.setattr(
         live_search_module,
@@ -57,3 +62,38 @@ def test_live_search_prefers_current_change_event(
     )
 
     assert result == "ivysaur"
+
+
+def test_live_search_keeps_empty_component_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Das Leeren der Suche darf keinen älteren Wert wiederherstellen."""
+    monkeypatch.setitem(
+        st.session_state,
+        "live-search-test",
+        {"value": "pikachu"},
+    )
+
+    def component_result(**_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(value="", changed="")
+
+    monkeypatch.setattr(
+        live_search_module,
+        "_live_search_component",
+        component_result,
+    )
+
+    result = live_search_input(
+        "Suche",
+        placeholder="Pokémon",
+        key="live-search-test",
+    )
+
+    assert result == ""
+
+
+def test_live_search_debounces_without_overwriting_focused_input() -> None:
+    """Die Komponente schützt schnelles Tippen vor veralteten Reruns."""
+    assert 100 <= _DEBOUNCE_MS <= 300
+    assert "setTimeout" in _LIVE_SEARCH_JS
+    assert "input.matches(':focus')" in _LIVE_SEARCH_JS

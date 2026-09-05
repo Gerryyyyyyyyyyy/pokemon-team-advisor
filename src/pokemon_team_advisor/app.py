@@ -1,4 +1,4 @@
-"""Interaktive Streamlit-Oberfläche für die defensive Teamtypenanalyse.
+"""Interaktive Streamlit-Oberfläche für Teamanalyse und Empfehlungen.
 
 Die Oberfläche liest ausschließlich vorbereitete lokale CSV-Dateien. Sie führt
 keine SQL-Abfragen aus, schreibt keine Nutzereingaben und übergibt keine freie
@@ -6,12 +6,23 @@ Eingabe an Dateipfade, HTML oder externe Dienste.
 """
 
 from pathlib import Path
+from typing import TypedDict
 from urllib.parse import urlparse
 
 import pandas as pd  # type: ignore[import-untyped]
 import streamlit as st
 
+from pokemon_team_advisor.i18n import (
+    DEFAULT_LANGUAGE,
+    LANGUAGE_OPTIONS,
+    Language,
+    language_from_option,
+    text,
+    type_name,
+)
 from pokemon_team_advisor.live_search import live_search_input
+from pokemon_team_advisor.recommender import Recommendation, recommend_team_members
+from pokemon_team_advisor.roles import Role
 from pokemon_team_advisor.team_analysis import (
     analyze_team_defense,
     summarize_team_weaknesses,
@@ -63,6 +74,42 @@ REQUIRED_POKEMON_COLUMNS = frozenset(
     }
 )
 
+RECOMMENDER_POKEMON_COLUMNS = frozenset(
+    {
+        "id",
+        "name",
+        "type_1",
+        "type_2",
+        "hp",
+        "attack",
+        "defense",
+        "special_attack",
+        "special_defense",
+        "speed",
+        "base_stat_total",
+        "is_final_evolution",
+    }
+)
+
+ROLE_TEXT_KEYS = {
+    Role.PHYSICAL_ATTACKER: "role_physical_attacker",
+    Role.SPECIAL_ATTACKER: "role_special_attacker",
+    Role.FAST_ATTACKER: "role_fast_attacker",
+    Role.PHYSICAL_DEFENDER: "role_physical_defender",
+    Role.SPECIAL_DEFENDER: "role_special_defender",
+    Role.ALL_ROUNDER: "role_all_rounder",
+}
+
+
+class RecommendationPresentation(TypedDict):
+    """Sicher formatierte Erklärung für eine Empfehlungskarte."""
+
+    score: str
+    components: str
+    roles: str
+    threats: str
+
+
 # Nur Sprites aus dem bekannten PokéAPI-Repository werden im Browser angezeigt.
 # Dadurch kann ein manipulierter CSV-Eintrag keine beliebige Tracking- oder
 # unsichere URL in die Oberfläche einschleusen.
@@ -73,12 +120,20 @@ ALLOWED_SPRITE_PATH_PREFIX = "/PokeAPI/sprites/"
 # Oberfläche schnell und verhindert eine unübersichtliche Wand aus 1.025 Karten.
 MAX_VISIBLE_RESULTS = 24
 TEAM_SESSION_KEY = "selected_team_names"
+LANGUAGE_SESSION_KEY = "interface_language"
 
 SORT_OPTIONS = {
     "Pokédex-Nummer": ("id", True),
     "Name A–Z": ("name", True),
     "Stärkste zuerst": ("base_stat_total", False),
     "Niedrigster Gesamtwert": ("base_stat_total", True),
+}
+
+SORT_TEXT_KEYS = {
+    "Pokédex-Nummer": "sort_pokedex",
+    "Name A–Z": "sort_name",
+    "Stärkste zuerst": "sort_strongest",
+    "Niedrigster Gesamtwert": "sort_lowest",
 }
 
 
@@ -187,6 +242,109 @@ def _boolean_value(value: object, *, field: str) -> bool:
     raise ValueError(f"Field '{field}' must be a boolean.")
 
 
+def _text_value(value: object, *, field: str) -> str:
+    """Einen nicht leeren Textwert aus dem validierten Datensatz lesen."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Field '{field}' must be a non-empty string.")
+    return value
+
+
+def pokemon_recommender_records(pokemon: pd.DataFrame) -> list[dict[str, object]]:
+    """Den DataFrame sicher in Eingabedatensätze des Recommenders umwandeln."""
+    missing_columns = RECOMMENDER_POKEMON_COLUMNS.difference(pokemon.columns)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"Recommender data is missing columns: {missing}.")
+
+    records: list[dict[str, object]] = []
+    seen_ids: set[int] = set()
+
+    for row_index, (_, row) in enumerate(pokemon.iterrows()):
+        pokemon_id = _integer_value(row["id"], field=f"pokemon[{row_index}].id")
+        if pokemon_id in seen_ids:
+            raise ValueError(f"Duplicate Pokémon id: {pokemon_id}.")
+        seen_ids.add(pokemon_id)
+
+        type_1 = _text_value(row["type_1"], field=f"pokemon[{row_index}].type_1")
+        raw_type_2 = row["type_2"]
+        type_2 = (
+            None
+            if pd.isna(raw_type_2)
+            else _text_value(raw_type_2, field=f"pokemon[{row_index}].type_2")
+        )
+        if type_1 == type_2:
+            raise ValueError("A Pokémon must not have duplicate types.")
+
+        record: dict[str, object] = {
+            "id": pokemon_id,
+            "name": _text_value(row["name"], field=f"pokemon[{row_index}].name"),
+            "type_1": type_1,
+            "type_2": type_2,
+            "is_final_evolution": _boolean_value(
+                row["is_final_evolution"],
+                field=f"pokemon[{row_index}].is_final_evolution",
+            ),
+        }
+        for stat_name in (
+            "hp",
+            "attack",
+            "defense",
+            "special_attack",
+            "special_defense",
+            "speed",
+            "base_stat_total",
+        ):
+            record[stat_name] = _integer_value(
+                row[stat_name],
+                field=f"pokemon[{row_index}].{stat_name}",
+            )
+        records.append(record)
+
+    return records
+
+
+def recommendation_presentation(
+    recommendation: Recommendation,
+    *,
+    language: Language = DEFAULT_LANGUAGE,
+) -> RecommendationPresentation:
+    """Eine Empfehlung ohne HTML oder unkontrollierte Texte beschriften."""
+    roles = " · ".join(
+        text(language, ROLE_TEXT_KEYS[role]) for role in recommendation["matched_roles"]
+    )
+    threats = ", ".join(
+        type_name(language, attacking_type) for attacking_type in recommendation["covered_threats"]
+    )
+
+    return RecommendationPresentation(
+        score=f"{recommendation['total_score']:.1f} / 100",
+        components=text(
+            language,
+            "recommendation_components",
+            defense=f"{recommendation['defensive_score']:.0%}",
+            role=f"{recommendation['role_score']:.0%}",
+            strength=f"{recommendation['strength_score']:.0%}",
+        ),
+        roles=roles,
+        threats=threats or text(language, "no_covered_threats"),
+    )
+
+
+@st.cache_data(show_spinner=False)
+def cached_team_recommendations(
+    team_ids: tuple[int, ...],
+    pokemon_records: list[dict[str, object]],
+    chart: dict[str, dict[str, float]],
+) -> list[Recommendation]:
+    """Empfehlungen zwischen unveränderten Streamlit-Neuläufen wiederverwenden."""
+    return recommend_team_members(
+        team_ids,
+        pokemon_records,
+        chart=chart,
+        limit=5,
+    )
+
+
 def selected_team_records(
     pokemon: pd.DataFrame,
     selected_names: list[str],
@@ -228,11 +386,16 @@ def selected_team_records(
     return records
 
 
-def type_label(type_1: str, type_2: str | None) -> str:
+def type_label(
+    type_1: str,
+    type_2: str | None,
+    *,
+    language: Language = DEFAULT_LANGUAGE,
+) -> str:
     """Typen als ruhige Textzeile statt als ungeprüftes HTML darstellen."""
-    type_names = [format_name(type_1)]
+    type_names = [type_name(language, type_1)]
     if type_2 is not None:
-        type_names.append(format_name(type_2))
+        type_names.append(type_name(language, type_2))
     return " · ".join(type_names)
 
 
@@ -316,7 +479,7 @@ def filter_pokemon(
         filtered = filtered[filtered["evolution_stage"].eq(evolution_stage)]
 
     if final_only:
-        filtered = filtered[filtered["is_final_evolution"].eq(True)]  # noqa: E712
+        filtered = filtered[filtered["is_final_evolution"].eq(True)]
 
     if dual_type_only:
         filtered = filtered[filtered["type_2"].notna()]
@@ -334,6 +497,7 @@ def render_team_cards(
     team: list[dict[str, object]],
     *,
     removable: bool = False,
+    language: Language = DEFAULT_LANGUAGE,
 ) -> str | None:
     """Das vollständige Team in einer Reihe darstellen.
 
@@ -362,24 +526,32 @@ def render_team_cards(
                 st.image(sprite_url, width=112)
 
             st.subheader(format_name(name))
-            st.caption(type_label(type_1, type_2))
+            st.caption(type_label(type_1, type_2, language=language))
             st.metric(
-                "Gesamtbasiswert",
+                text(language, "total_bst"),
                 _integer_value(
                     member["base_stat_total"],
                     field="base_stat_total",
                 ),
             )
 
-            final_label = "final" if bool(member["is_final_evolution"]) else "nicht final"
+            final_label = text(
+                language,
+                "final" if bool(member["is_final_evolution"]) else "not_final",
+            )
             st.caption(
-                f"Generation {member['generation']} · "
-                f"Stufe {member['evolution_stage']}/"
-                f"{member['evolution_max_stage']} · {final_label}"
+                text(
+                    language,
+                    "member_metadata",
+                    generation=member["generation"],
+                    stage=member["evolution_stage"],
+                    max_stage=member["evolution_max_stage"],
+                    final_status=final_label,
+                )
             )
 
             if removable and st.button(
-                "Aus Team entfernen",
+                text(language, "remove_from_team"),
                 key=f"remove-team-{name}",
                 use_container_width=True,
             ):
@@ -392,6 +564,7 @@ def render_pokemon_browser(
     candidates: pd.DataFrame,
     *,
     selected_names: list[str],
+    language: Language = DEFAULT_LANGUAGE,
 ) -> tuple[str | None, bool]:
     """Gefilterte Pokémon als kompakte Karten statt als lange Liste anzeigen.
 
@@ -421,15 +594,22 @@ def render_pokemon_browser(
                 st.markdown(f"**{format_name(name)}**")
                 st.caption(
                     f"#{_integer_value(pokemon_row['id'], field='id'):04d} · "
-                    f"{type_label(str(pokemon_row['type_1']), type_2)}"
+                    f"{type_label(str(pokemon_row['type_1']), type_2, language=language)}"
                 )
                 st.caption(
-                    f"Gen. {_integer_value(pokemon_row['generation'], field='generation')} · "
-                    f"BST {_integer_value(pokemon_row['base_stat_total'], field='base_stat_total')}"
+                    text(
+                        language,
+                        "browser_metadata",
+                        generation=_integer_value(pokemon_row["generation"], field="generation"),
+                        bst=_integer_value(pokemon_row["base_stat_total"], field="base_stat_total"),
+                    )
                 )
 
                 team_is_full = len(selected_names) >= 5
-                button_label = "Entfernen" if is_selected else "Zum Team"
+                button_label = text(
+                    language,
+                    "remove" if is_selected else "add_to_team",
+                )
                 if st.button(
                     button_label,
                     key=f"browser-team-{name}",
@@ -446,33 +626,35 @@ def render_pokemon_browser(
 def render_defense_analysis(
     team: list[dict[str, object]],
     chart: dict[str, dict[str, float]],
+    *,
+    language: Language = DEFAULT_LANGUAGE,
 ) -> None:
     """Gemeinsame Schwächen und vollständige Abdeckung sachlich darstellen."""
     analysis = analyze_team_defense(team, chart=chart)
     summary = summarize_team_weaknesses(analysis)
     shared_weaknesses = [entry for entry in summary if entry["weakness_count"] >= 2]
 
-    st.header("Defensive Typenanalyse")
+    st.header(text(language, "defense_title"))
 
     if shared_weaknesses:
         shared_names = ", ".join(
-            format_name(entry["attacking_type"]) for entry in shared_weaknesses
+            type_name(language, entry["attacking_type"]) for entry in shared_weaknesses
         )
-        st.warning(f"Gemeinsame Schwächen: {shared_names}")
+        st.warning(text(language, "shared_weaknesses", types=shared_names))
     else:
-        st.success("Keine gemeinsame Typenschwäche in der aktuellen Auswahl.")
+        st.success(text(language, "no_shared_weakness"))
 
     if summary:
         summary_rows = [
             {
-                "Angriffstyp": format_name(entry["attacking_type"]),
-                "Schwache Mitglieder": ", ".join(
+                text(language, "attack_type"): type_name(language, entry["attacking_type"]),
+                text(language, "weak_members"): ", ".join(
                     format_name(name) for name in entry["weak_members"]
                 ),
-                "Schwächen": entry["weakness_count"],
-                "Resistenzen": entry["resistance_count"],
-                "Immunitäten": entry["immunity_count"],
-                "Max. Faktor": f"×{entry['maximum_multiplier']:g}",
+                text(language, "weaknesses"): entry["weakness_count"],
+                text(language, "resistances"): entry["resistance_count"],
+                text(language, "immunities"): entry["immunity_count"],
+                text(language, "maximum_factor"): f"×{entry['maximum_multiplier']:g}",
             }
             for entry in summary
         ]
@@ -482,20 +664,26 @@ def render_defense_analysis(
             use_container_width=True,
         )
 
-    with st.expander("Vollständige defensive Abdeckung"):
+    with st.expander(text(language, "coverage_title")):
         coverage_rows = []
 
         for attacking_type, entry in analysis.items():
             coverage_rows.append(
                 {
-                    "Angriffstyp": format_name(attacking_type),
-                    "Schwach": ", ".join(format_name(name) for name in entry["weak_members"])
+                    text(language, "attack_type"): type_name(language, attacking_type),
+                    text(language, "weak"): ", ".join(
+                        format_name(name) for name in entry["weak_members"]
+                    )
                     or "–",
-                    "Resistent": ", ".join(format_name(name) for name in entry["resistant_members"])
+                    text(language, "resistant"): ", ".join(
+                        format_name(name) for name in entry["resistant_members"]
+                    )
                     or "–",
-                    "Immun": ", ".join(format_name(name) for name in entry["immune_members"])
+                    text(language, "immune"): ", ".join(
+                        format_name(name) for name in entry["immune_members"]
+                    )
                     or "–",
-                    "Neutral": len(entry["neutral_members"]),
+                    text(language, "neutral"): len(entry["neutral_members"]),
                 }
             )
 
@@ -506,30 +694,107 @@ def render_defense_analysis(
         )
 
 
+def render_recommendations(
+    recommendations: list[Recommendation],
+    pokemon: pd.DataFrame,
+    *,
+    language: Language = DEFAULT_LANGUAGE,
+) -> None:
+    """Die fünf besten Kandidaten als nachvollziehbare Karten darstellen."""
+    if not recommendations:
+        st.warning(text(language, "no_recommendations"))
+        return
+
+    pokemon_by_id = pokemon.set_index("id", drop=False)
+    if not pokemon_by_id.index.is_unique:
+        raise ValueError("Pokémon ids must be unique for recommendation rendering.")
+
+    st.header(text(language, "recommendations_title"))
+    st.caption(text(language, "recommendations_caption"))
+
+    with st.expander(text(language, "recommendations_explanation_title")):
+        st.write(text(language, "recommendations_explanation"))
+
+    for start_index in range(0, len(recommendations), 3):
+        recommendation_group = recommendations[start_index : start_index + 3]
+        columns = st.columns(len(recommendation_group))
+
+        for rank_offset, (column, recommendation) in enumerate(
+            zip(columns, recommendation_group, strict=True),
+            start=start_index + 1,
+        ):
+            pokemon_id = recommendation["pokemon_id"]
+            if pokemon_id not in pokemon_by_id.index:
+                raise ValueError(f"Unknown recommendation id: {pokemon_id}.")
+
+            row = pokemon_by_id.loc[pokemon_id]
+            raw_type_2 = row["type_2"]
+            type_2 = None if pd.isna(raw_type_2) else str(raw_type_2)
+            presentation = recommendation_presentation(
+                recommendation,
+                language=language,
+            )
+
+            with column.container(border=True):
+                sprite_url = safe_sprite_url(row["sprite_url"])
+                if sprite_url is not None:
+                    st.image(sprite_url, width=112)
+
+                st.subheader(f"{rank_offset}. {format_name(recommendation['name'])}")
+                st.caption(type_label(str(row["type_1"]), type_2, language=language))
+                st.metric(text(language, "recommendation_score"), presentation["score"])
+                st.progress(recommendation["total_score"] / 100.0)
+                st.write(presentation["components"])
+                st.caption(text(language, "matching_roles", roles=presentation["roles"]))
+                if recommendation["covered_threats"]:
+                    st.success(
+                        text(
+                            language,
+                            "covered_threats",
+                            threats=presentation["threats"],
+                        )
+                    )
+                else:
+                    st.caption(presentation["threats"])
+
+
 def main() -> None:
-    """Team-Auswahl und defensive Typenanalyse darstellen."""
+    """Team-Auswahl, Typenanalyse und Empfehlungen darstellen."""
     st.set_page_config(
         page_title="Pokémon Team Advisor",
         layout="wide",
     )
 
-    title_column, loadout_column = st.columns([5, 1])
+    title_column, language_column, loadout_column = st.columns([5, 1, 1])
+    with language_column:
+        language_option = st.segmented_control(
+            "Sprache / Language",
+            options=LANGUAGE_OPTIONS,
+            default="DE",
+            key=LANGUAGE_SESSION_KEY,
+        )
+    language = language_from_option(language_option)
+
     with title_column:
         st.title("Pokémon Team Advisor")
-        st.write(
-            "Stelle ein Team aus bis zu fünf Pokémon zusammen. Filtere den "
-            "Pokédex und erkenne gemeinsame defensive Schwächen."
+        st.write(text(language, "intro"))
+    with (
+        loadout_column,
+        st.popover(text(language, "loadouts_open"), use_container_width=True),
+    ):
+        st.subheader(text(language, "loadouts_title"))
+        st.caption(text(language, "loadouts_future"))
+        st.write(text(language, "loadouts_description"))
+        st.button(
+            text(language, "loadout_save"),
+            disabled=True,
+            use_container_width=True,
         )
-    with loadout_column:
-        with st.popover("Loadouts ansehen", use_container_width=True):
-            st.subheader("Loadouts")
-            st.caption("Für eine spätere Projektphase vorgesehen")
-            st.write(
-                "Hier kannst du später gespeicherte Teams öffnen, vergleichen "
-                "und als Ausgangspunkt für neue Analysen verwenden."
-            )
-            st.button("Loadout speichern", disabled=True, use_container_width=True)
-            st.button("Loadout laden", disabled=True, use_container_width=True)
+        st.button(
+            text(language, "loadout_load"),
+            disabled=True,
+            use_container_width=True,
+        )
 
     try:
         pokemon = load_pokemon_data(POKEMON_DATA_PATH)
@@ -537,10 +802,7 @@ def main() -> None:
     except (OSError, ValueError):
         # Technische Pfade oder Parserdetails werden bewusst nicht im Browser
         # ausgegeben. Die Oberfläche zeigt nur eine handlungsorientierte Meldung.
-        st.error(
-            "Die aufbereiteten Datendateien fehlen oder sind ungültig. "
-            "Erzeuge zuerst die Pokémon-Daten und die Typenmatrix."
-        )
+        st.error(text(language, "data_error"))
         st.stop()
 
     # Der Teamzustand enthält ausschließlich Namen, die aus dem validierten
@@ -562,21 +824,28 @@ def main() -> None:
             selected_names.append(value)
     st.session_state[TEAM_SESSION_KEY] = selected_names
 
-    st.sidebar.header("Pokédex filtern")
+    st.sidebar.header(text(language, "filters_header"))
     selected_types = st.sidebar.multiselect(
-        "Typ",
+        text(language, "filter_type"),
         options=sorted(EXPECTED_TYPES),
-        format_func=format_name,
-        placeholder="Alle Typen",
+        format_func=lambda value: type_name(language, value),
+        placeholder=text(language, "all_types"),
     )
     selected_generations = st.sidebar.multiselect(
-        "Generation",
+        text(language, "filter_generation"),
         options=list(range(1, 10)),
-        placeholder="Alle Generationen",
+        placeholder=text(language, "all_generations"),
     )
+    stage_text_keys = {
+        "Alle": "stage_all",
+        "Basis": "stage_base",
+        "1. Entwicklung": "stage_first",
+        "2. Entwicklung": "stage_second",
+    }
     stage_label = st.sidebar.radio(
-        "Entwicklungsstufe",
-        options=["Alle", "Basis", "1. Entwicklung", "2. Entwicklung"],
+        text(language, "filter_stage"),
+        options=list(stage_text_keys),
+        format_func=lambda value: text(language, stage_text_keys[value]),
     )
     stage_by_label = {
         "Alle": None,
@@ -584,14 +853,14 @@ def main() -> None:
         "1. Entwicklung": 1,
         "2. Entwicklung": 2,
     }
-    final_only = st.sidebar.toggle("Nur finale Entwicklungen")
-    dual_type_only = st.sidebar.toggle("Nur Pokémon mit zwei Typen")
+    final_only = st.sidebar.toggle(text(language, "filter_final_only"))
+    dual_type_only = st.sidebar.toggle(text(language, "filter_dual_only"))
     maximum_bst = _integer_value(
         pokemon["base_stat_total"].max(),
         field="maximum_base_stat_total",
     )
     minimum_bst = st.sidebar.slider(
-        "Mindest-Gesamtbasiswert",
+        text(language, "filter_minimum_bst"),
         min_value=0,
         max_value=maximum_bst,
         value=0,
@@ -599,28 +868,42 @@ def main() -> None:
     )
     st.sidebar.divider()
     st.sidebar.caption(
-        f"{len(pokemon)} Pokémon · {len(chart)} Typen · lokale, schreibgeschützte Daten"
+        text(
+            language,
+            "dataset_summary",
+            pokemon_count=len(pokemon),
+            type_count=len(chart),
+        )
     )
 
     with st.container(border=True):
         heading_column, metric_column = st.columns([4, 1])
         with heading_column:
-            st.subheader("Dein Team")
-            st.caption("Wähle bis zu fünf Pokémon für die defensive Analyse aus.")
+            st.subheader(text(language, "team_title"))
+            st.caption(text(language, "team_instruction"))
         with metric_column:
-            st.metric("Belegte Plätze", f"{len(selected_names)} / 5")
+            st.metric(text(language, "occupied_slots"), f"{len(selected_names)} / 5")
 
+        free_slots = 5 - len(selected_names)
         st.progress(
             len(selected_names) / 5,
-            text=f"{5 - len(selected_names)} Plätze frei",
+            text=text(
+                language,
+                "one_free_slot" if free_slots == 1 else "free_slots",
+                count=free_slots,
+            ),
         )
 
         if selected_names:
             try:
                 team = selected_team_records(pokemon, selected_names)
-                removed_name = render_team_cards(team, removable=True)
+                removed_name = render_team_cards(
+                    team,
+                    removable=True,
+                    language=language,
+                )
             except ValueError:
-                st.error("Das gespeicherte Team konnte nicht sicher verarbeitet werden.")
+                st.error(text(language, "team_error"))
                 return
 
             if removed_name is not None:
@@ -629,21 +912,49 @@ def main() -> None:
                 ]
                 st.rerun()
         else:
-            st.info("Dein Team ist noch leer. Suche unten nach dem ersten Pokémon.")
+            st.info(text(language, "empty_team"))
 
-    st.header("Pokédex durchsuchen")
+    if len(selected_names) == 5:
+        st.divider()
+        try:
+            recommender_records = pokemon_recommender_records(pokemon)
+            recommender_records_by_name = {
+                str(record["name"]): record for record in recommender_records
+            }
+            team_ids = [
+                _integer_value(
+                    recommender_records_by_name[name]["id"],
+                    field=f"team.{name}.id",
+                )
+                for name in selected_names
+            ]
+            recommendations = cached_team_recommendations(
+                tuple(team_ids),
+                recommender_records,
+                chart,
+            )
+            render_recommendations(
+                recommendations,
+                pokemon,
+                language=language,
+            )
+        except (KeyError, TypeError, ValueError):
+            st.error(text(language, "recommendations_error"))
+
+    st.header(text(language, "search_title"))
     search_column, sort_column = st.columns([3, 1])
     with search_column:
         search_text = live_search_input(
-            "Name oder Pokédex-Nummer",
-            placeholder="Zum Beispiel Gengar, Mr Mime oder #025",
+            text(language, "search_label"),
+            placeholder=text(language, "search_placeholder"),
             key="pokedex-live-search",
             max_chars=80,
         )
     with sort_column:
         sort_by = st.selectbox(
-            "Sortierung",
+            text(language, "sort_label"),
             options=list(SORT_OPTIONS),
+            format_func=lambda value: text(language, SORT_TEXT_KEYS[value]),
         )
 
     try:
@@ -659,24 +970,28 @@ def main() -> None:
             sort_by=sort_by,
         )
     except ValueError:
-        st.error("Die Filter konnten nicht sicher verarbeitet werden.")
+        st.error(text(language, "filter_error"))
         return
 
     result_count = len(candidates)
     result_column, limit_column = st.columns(2)
-    result_column.metric("Treffer", result_count)
+    result_column.metric(text(language, "results"), result_count)
     if result_count > MAX_VISIBLE_RESULTS:
         limit_column.caption(
-            f"Die ersten {MAX_VISIBLE_RESULTS} Treffer werden angezeigt. "
-            "Grenze die Suche weiter ein."
+            text(
+                language,
+                "results_limited",
+                limit=MAX_VISIBLE_RESULTS,
+            )
         )
 
     if candidates.empty:
-        st.warning("Kein Pokémon passt zu dieser Suche und den aktiven Filtern.")
+        st.warning(text(language, "no_results"))
     else:
         clicked_name, clicked_was_selected = render_pokemon_browser(
             candidates,
             selected_names=selected_names,
+            language=language,
         )
         if clicked_name is not None:
             if clicked_was_selected:
@@ -695,10 +1010,11 @@ def main() -> None:
             render_defense_analysis(
                 selected_team_records(pokemon, selected_names),
                 chart,
+                language=language,
             )
         except ValueError:
             # Keine internen Daten oder Stacktraces an die UI weiterreichen.
-            st.error("Das Team konnte nicht sicher analysiert werden.")
+            st.error(text(language, "analysis_error"))
             return
 
 
