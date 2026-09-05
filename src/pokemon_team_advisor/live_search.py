@@ -8,6 +8,8 @@ oder wenn das Feld den Fokus verliert. Diese lokale Komponente meldet jede
 
 import streamlit as st
 
+_DEBOUNCE_MS = 180
+
 _LIVE_SEARCH_HTML = """
 <label for="live-search-input"></label>
 <input id="live-search-input" type="search" autocomplete="off" />
@@ -56,17 +58,30 @@ export default function(component) {
     input.placeholder = data.placeholder;
     input.maxLength = data.maxChars;
 
-    if (input.value !== data.value) {
-        input.value = data.value ?? '';
+    const incomingValue = data.value ?? '';
+
+    // Während des Tippens kann ein Streamlit-Rerun noch einen älteren
+    // Python-Wert enthalten. Das fokussierte Feld darf dadurch nicht auf
+    // einen veralteten Zwischenstand zurückgesetzt werden.
+    if (input.dataset.initialized !== 'true') {
+        input.value = incomingValue;
+        input.dataset.initialized = 'true';
+    } else if (!input.matches(':focus') && input.value !== incomingValue) {
+        input.value = incomingValue;
     }
 
     input.oninput = (event) => {
         const value = event.target.value.slice(0, data.maxChars);
+        event.target.value = value;
 
-        // Der Zustand speichert den Text. Das zusätzliche Trigger-Ereignis sorgt
-        // dafür, dass Streamlit die Treffer sofort neu berechnet.
+        // Der Zustand wird bei jedem Zeichen lokal aktualisiert. Nur das
+        // verzögerte Trigger-Ereignis startet einen Streamlit-Rerun.
         setStateValue('value', value);
-        setTriggerValue('changed', value);
+
+        globalThis.clearTimeout(input.searchDebounceTimer);
+        input.searchDebounceTimer = globalThis.setTimeout(() => {
+            setTriggerValue('changed', value);
+        }, data.debounceMs);
     };
 }
 """
@@ -113,6 +128,7 @@ def live_search_input(
             "placeholder": placeholder,
             "value": current_value,
             "maxChars": max_chars,
+            "debounceMs": _DEBOUNCE_MS,
         },
         default={"value": current_value},
         key=key,
@@ -121,9 +137,6 @@ def live_search_input(
         height="content",
     )
 
-    # Der Triggerwert gehört zum aktuellen Tastendruck. Bei anderen Neuläufen
-    # greifen wir auf den dauerhaft gespeicherten Zustandswert zurück.
-    changed_value = _limited_text(result.changed, max_chars=max_chars)
-    if changed_value:
-        return changed_value
+    # ``changed`` löst nur den verzögerten Rerun aus. Der Zustandswert ist die
+    # einzige Quelle für den Suchtext und bildet auch ein leeres Feld korrekt ab.
     return _limited_text(result.value, max_chars=max_chars)

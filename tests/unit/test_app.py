@@ -5,9 +5,15 @@ import pytest
 
 from pokemon_team_advisor.app import (
     filter_pokemon,
+    pokemon_recommender_records,
+    recommendation_presentation,
     safe_sprite_url,
     selected_team_records,
+    type_label,
 )
+from pokemon_team_advisor.i18n import Language
+from pokemon_team_advisor.recommender import Recommendation
+from pokemon_team_advisor.roles import Role
 
 
 def _pokemon_data() -> pd.DataFrame:
@@ -21,6 +27,12 @@ def _pokemon_data() -> pd.DataFrame:
                 "species_name": f"pokemon-{pokemon_id}",
                 "type_1": "normal",
                 "type_2": None,
+                "hp": 50,
+                "attack": 50,
+                "defense": 50,
+                "special_attack": 50,
+                "special_defense": 50,
+                "speed": 50,
                 "base_stat_total": 300,
                 "sprite_url": (
                     "https://raw.githubusercontent.com/PokeAPI/sprites/"
@@ -199,3 +211,118 @@ def test_filter_pokemon_rejects_unknown_filter_values() -> None:
     """Auch programmatisch manipulierte Typfilter werden zurückgewiesen."""
     with pytest.raises(ValueError, match="unknown Pokémon type"):
         filter_pokemon(_filter_data(), selected_types=["cosmic"])
+
+
+def test_pokemon_recommender_records_normalizes_dataframe_values() -> None:
+    """Pandas-Werte typisiert und ohne NaN an die Fachlogik übergeben."""
+    pokemon = _pokemon_data()
+    pokemon.loc[pokemon["name"].eq("pokemon-2"), "type_2"] = "flying"
+
+    records = pokemon_recommender_records(pokemon)
+
+    assert len(records) == 6
+    assert records[0] == {
+        "id": 1,
+        "name": "pokemon-1",
+        "type_1": "normal",
+        "type_2": None,
+        "is_final_evolution": True,
+        "hp": 50,
+        "attack": 50,
+        "defense": 50,
+        "special_attack": 50,
+        "special_defense": 50,
+        "speed": 50,
+        "base_stat_total": 300,
+    }
+    assert records[1]["type_2"] == "flying"
+
+
+def test_pokemon_recommender_records_requires_all_stats() -> None:
+    """Eine unvollständige CSV nicht stillschweigend bewerten."""
+    pokemon = _pokemon_data().drop(columns="speed")
+
+    with pytest.raises(ValueError, match="missing columns: speed"):
+        pokemon_recommender_records(pokemon)
+
+
+def test_pokemon_recommender_records_rejects_duplicate_ids() -> None:
+    """Empfehlungen müssen Kandidaten eindeutig zur UI-Zeile zuordnen können."""
+    pokemon = _pokemon_data()
+    pokemon.loc[pokemon["name"].eq("pokemon-2"), "id"] = 1
+
+    with pytest.raises(ValueError, match="Duplicate Pokémon id: 1"):
+        pokemon_recommender_records(pokemon)
+
+
+def test_recommendation_presentation_explains_all_score_components() -> None:
+    """Eine Empfehlung vollständig und ohne HTML formatieren."""
+    recommendation = Recommendation(
+        pokemon_id=6,
+        name="example-pokemon",
+        total_score=78.24,
+        defensive_score=0.625,
+        role_score=0.9,
+        strength_score=0.72,
+        matched_roles=(Role.PHYSICAL_ATTACKER, Role.FAST_ATTACKER),
+        covered_threats=("fire", "ice"),
+    )
+
+    presentation = recommendation_presentation(recommendation)
+
+    assert presentation == {
+        "score": "78.2 / 100",
+        "components": "Defensive Ergänzung 62% · Rollenlücke 90% · Stärke 72%",
+        "roles": "Physischer Angreifer · Schneller Angreifer",
+        "threats": "Feuer, Eis",
+    }
+
+
+def test_recommendation_presentation_supports_english() -> None:
+    """Alle dynamischen Teile einer Empfehlung auf Englisch beschriften."""
+    recommendation = Recommendation(
+        pokemon_id=6,
+        name="example-pokemon",
+        total_score=78.24,
+        defensive_score=0.625,
+        role_score=0.9,
+        strength_score=0.72,
+        matched_roles=(Role.PHYSICAL_ATTACKER, Role.FAST_ATTACKER),
+        covered_threats=("fire", "ice"),
+    )
+
+    presentation = recommendation_presentation(
+        recommendation,
+        language=Language.ENGLISH,
+    )
+
+    assert presentation == {
+        "score": "78.2 / 100",
+        "components": "Defensive contribution 62% · Role gap 90% · Strength 72%",
+        "roles": "Physical attacker · Fast attacker",
+        "threats": "Fire, Ice",
+    }
+
+
+def test_recommendation_presentation_handles_no_covered_threat() -> None:
+    """Auch Kandidaten ohne konkrete Resistenz verständlich erklären."""
+    recommendation = Recommendation(
+        pokemon_id=6,
+        name="example-pokemon",
+        total_score=50.0,
+        defensive_score=0.5,
+        role_score=0.5,
+        strength_score=0.5,
+        matched_roles=(Role.ALL_ROUNDER,),
+        covered_threats=(),
+    )
+
+    presentation = recommendation_presentation(recommendation)
+
+    assert presentation["threats"] == "Keine aktuelle Teamschwäche resistiert"
+
+
+def test_type_label_uses_selected_language() -> None:
+    """Typbezeichnungen wechseln, während interne Typwerte stabil bleiben."""
+    assert type_label("fire", "flying") == "Feuer · Flug"
+    assert type_label("fire", "flying", language=Language.ENGLISH) == "Fire · Flying"
